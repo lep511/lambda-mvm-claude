@@ -1,0 +1,13 @@
+# Python dependencies for the claude-agent MicroVM image. The Dockerfile
+# installs this file; adding a library here is an image change, so it needs a
+# rebuild (unlike editing agent-prompt.md, which is job input).
+
+# The lambda-microvms client, so the agent can terminate its own VM.
+boto3>=1.43.0
+
+# Spreadsheet toolbox for prompts/xls-analysis.md. These are complementary, not
+# redundant: xlrd 2.x dropped .xlsx and reads ONLY the legacy binary .xls,
+# which openpyxl cannot open at all.
+xlsx2csv
+openpyxl
+xlrd>=2.0

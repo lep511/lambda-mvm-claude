@@ -1,0 +1,15 @@
+# Real environment file — .env.example is the one that is tracked.
+.env
+
+# Build artifact produced by agent/build-image.sh.
+agent/claude-agent.zip
+
+# Participant input and output: what the agent is given and what it hands
+# back. Both directories stay in git (via .gitkeep), their contents do not.
+# agent-prompt.md is NOT ignored — the task definition is source.
+input/*
+!input/.gitkeep
+output/*
+!output/.gitkeep
+
+__pycache__/
