@@ -55,6 +55,12 @@ now_ms() { echo $(( $(date +%s) * 1000 )); }
 fmt_ms() { date -u -d "@$(( $1 / 1000 ))" +"%H:%M:%S"; }
 
 # ── 1. which run ─────────────────────────────────────────────────────────────
+# The VM list comes first because it decides what "in flight" can even mean: a
+# pending run with no VM alive is not running, it is abandoned.
+VMS="$(aws lambda-microvms list-microvms --region "${AWS_REGION}" --output json 2>/dev/null || echo '{}')"
+RUNNING="$(jq -r '[.items[]? | select(.state == "RUNNING" or .state == "STARTING")]' <<<"${VMS}")"
+RUNNING_N="$(jq 'length' <<<"${RUNNING}")"
+
 # One listing, then everything is decided locally: the alternative is a
 # head-object per candidate, which is slower and racier.
 ALL_KEYS="$(aws s3api list-objects-v2 \
@@ -77,13 +83,19 @@ RUN_SUMMARY="$(jq -n --argjson keys "${ALL_KEYS}" --arg p "${RUNS_PREFIX}/" '
   | {all: $all, done: $done, pending: ($all - $done)}')"
 
 if [[ -z "${RUN_ID}" ]]; then
-  RUN_ID="$(jq -r '.pending | sort | last // empty' <<<"${RUN_SUMMARY}")"
-  if [[ -z "${RUN_ID}" ]]; then
+  PENDING="$(jq -r '.pending | sort | last // empty' <<<"${RUN_SUMMARY}")"
+  if [[ -n "${PENDING}" && "${RUNNING_N}" -gt 0 ]]; then
+    RUN_ID="${PENDING}"
+    echo "==> run in flight: ${RUN_ID} (newest without _status.json)"
+  else
+    # No VM alive, so nothing is in flight whatever S3 looks like. Show the
+    # most recent run instead — and name the abandoned one, because a run that
+    # died before writing _status.json would otherwise shadow every later run
+    # here for as long as it sits in the bucket.
     RUN_ID="$(jq -r '.all | sort | last // empty' <<<"${RUN_SUMMARY}")"
     [[ -n "${RUN_ID}" ]] || { echo "no runs under s3://${ARTIFACTS_BUCKET}/${RUNS_PREFIX}/"; exit 1; }
     echo "==> no run in flight; showing the most recent one: ${RUN_ID}"
-  else
-    echo "==> run in flight: ${RUN_ID} (newest without _status.json)"
+    [[ -n "${PENDING}" ]] && echo "    note: ${PENDING} has no _status.json and no VM — it never finished"
   fi
 else
   jq -e --arg r "${RUN_ID}" '.all | index($r)' <<<"${RUN_SUMMARY}" >/dev/null 2>&1 || {
@@ -108,9 +120,6 @@ echo "    input      ${INPUT_COUNT} file(s)"
 echo "    s3         ${PREFIX}/"
 
 # ── 2. the MicroVM ───────────────────────────────────────────────────────────
-VMS="$(aws lambda-microvms list-microvms --region "${AWS_REGION}" --output json 2>/dev/null || echo '{}')"
-RUNNING="$(jq -r '[.items[]? | select(.state == "RUNNING" or .state == "STARTING")]' <<<"${VMS}")"
-RUNNING_N="$(jq 'length' <<<"${RUNNING}")"
 if [[ "${RUNNING_N}" -gt 0 ]]; then
   # The age is computed with `date`, not jq's fromdate: startedAt comes back as
   # 2026-10-08T12:24:56.093000+00:00, and jq's ISO8601 parser rejects both the
@@ -193,7 +202,70 @@ else
   ' <<<"${SPANS}"
 fi
 
-# ── 5. what has actually been delivered ──────────────────────────────────────
+# ── 5. what it has cost so far ───────────────────────────────────────────────
+# Claude Code's own cost and token counters, which reach CloudWatch as EMF
+# metrics (../TELEMETRY.md). Readable mid-run: they are exported every
+# OTEL_METRIC_EXPORT_INTERVAL, so this number grows while the agent works.
+#
+# Metrics Insights (a SELECT expression) and NOT get-metric-statistics: Claude
+# Code publishes each datapoint with its full attribute set, 17 dimensions
+# here, and get-metric-statistics matches only a complete dimension set —
+# given `agent.run_id` alone it returns zero datapoints and no error, which
+# reads exactly like telemetry that never arrived.
+#
+# The window is anchored on the run id rather than on "the last N hours",
+# because a run id IS a timestamp (run-agent.sh uses date +%Y%m%d-%H%M%S) and
+# that keeps the query small for a run from days ago.
+echo "==> cost"
+WINDOW_FROM=""
+if [[ "${RUN_ID}" =~ ([0-9]{8})-([0-9]{2})([0-9]{2})([0-9]{2}) ]]; then
+  RUN_EPOCH="$(date -u -d "${BASH_REMATCH[1]} ${BASH_REMATCH[2]}:${BASH_REMATCH[3]}:${BASH_REMATCH[4]}" +%s 2>/dev/null || true)"
+  if [[ -n "${RUN_EPOCH:-}" ]]; then
+    WINDOW_FROM="$(date -u -d "@$(( RUN_EPOCH - 300 ))" +%FT%TZ)"
+    # Six hours is far more than CLAUDE_TIMEOUT allows a run to last, and
+    # capping at "now" keeps an in-flight run's window honest.
+    WINDOW_END_EPOCH=$(( RUN_EPOCH + 21600 ))
+    [[ "${WINDOW_END_EPOCH}" -gt "$(date +%s)" ]] && WINDOW_END_EPOCH="$(date +%s)"
+    WINDOW_TO="$(date -u -d "@${WINDOW_END_EPOCH}" +%FT%TZ)"
+  fi
+fi
+if [[ -z "${WINDOW_FROM}" ]]; then
+  # A run id that is not a timestamp (the smoke test's, for instance).
+  WINDOW_FROM="$(date -u -d '3 hours ago' +%FT%TZ)"
+  WINDOW_TO="$(date -u +%FT%TZ)"
+fi
+
+# One call per expression, and that is not a style choice: GetMetricData
+# accepts exactly ONE Metrics Insights query per request and answers a second
+# one with "Maximum number of queries (1) exceeded". Batching the two reads
+# into a single call fails every time, while each read on its own works.
+#
+# bash quotes the SQL, jq builds the JSON — the two never have to agree about
+# escaping, which is what makes this readable at all.
+insights_sum() {
+  local sql="$1" queries
+  queries="$(jq -n --arg q "${sql}" '[{Id:"q", Period:300, Expression:$q}]')"
+  aws cloudwatch get-metric-data \
+    --start-time "${WINDOW_FROM}" --end-time "${WINDOW_TO}" \
+    --metric-data-queries "${queries}" \
+    --region "${AWS_REGION}" --output json 2>/dev/null \
+    | jq -r '[.MetricDataResults[]?.Values[]?] | add // 0' 2>/dev/null \
+    || echo 0
+}
+
+USD="$(insights_sum "SELECT SUM(\"claude_code.cost.usage\") FROM \"ClaudeCodeAgent\" WHERE \"agent.run_id\" = '${RUN_ID}'")"
+TOKENS="$(insights_sum "SELECT SUM(\"claude_code.token.usage\") FROM \"ClaudeCodeAgent\" WHERE \"agent.run_id\" = '${RUN_ID}'")"
+if [[ "$(jq -r 'if (. | tonumber) > 0 then "yes" else "no" end' <<<"${USD:-0}" 2>/dev/null)" == "yes" ]]; then
+  printf "    spend      \$%.4f USD%s\n" "${USD}" \
+    "$([[ "${FINISHED}" -eq 1 ]] && echo "" || echo " so far")"
+  printf "    tokens     %.0f (all types; the span figures above are per-request)\n" "${TOKENS}"
+else
+  echo "    no cost metrics for this run id in namespace ClaudeCodeAgent"
+  echo "    an image built before metrics were exported, AGENT_TRACING=0, or a"
+  echo "    run that has not yet crossed one export interval — ../TELEMETRY.md"
+fi
+
+# ── 6. what has actually been delivered ──────────────────────────────────────
 # Artifacts only exist in S3 after `claude` exits — app.py uploads output/ in
 # one go — so an empty list mid-run is normal and not a warning sign.
 echo "==> artifacts"

@@ -390,9 +390,15 @@ SELECT SUM("claude_code.cost.usage")  FROM "ClaudeCodeAgent" GROUP BY "agent.tas
 SELECT SUM("claude_code.active_time.total") FROM "ClaudeCodeAgent" WHERE "agent.run_id" = '<run-id>'
 ```
 
-If you do want `get-metric-statistics`, get the whole dimension set first with
+Two limits worth knowing before you script around this: a request may carry
+**exactly one** Metrics Insights query (a second one fails with "Maximum number
+of queries (1) exceeded", so cost and tokens are two calls), and if you do want
+`get-metric-statistics`, get the whole dimension set first with
 `aws cloudwatch list-metrics --namespace ClaudeCodeAgent --metric-name
 "claude_code.cost.usage"` and pass every pair it returns.
+
+`agent/status.sh` already does the per-run version of all this — it prints the
+dollar figure and the token total for a run, finished or in flight.
 
 These are ordinary custom metrics, so they alarm and dashboard like any other —
 a workshop-sized use is an alarm on `claude_code.cost.usage` summed across the
@@ -584,7 +590,7 @@ done
 | `agent/app.py` | `start_collector()` at the top of a job and `wait_for_collector()` right before `claude` (the warm-up overlaps the input download), `agent_env()` stamps `agent.run_id`, `flush_telemetry()` between `_status.json` and `TerminateMicrovm`, and `/health` reports `tracing_enabled` / `telemetry_counters` |
 | `agent/build-image.sh` | `AGENT_TRACING` → both switches; `AGENT_TRACING_DETAILED` → the beta pair with the endpoint pinned to the in-VM collector; ships `otel-collector.yaml` in the zip and refuses to build without it |
 | `agent/test-image.sh` | Asserts the image can trace, costing no tokens |
-| `agent/status.sh` | Reads the spans of a run in flight to report what the agent is doing right now |
+| `agent/status.sh` | Reads the spans of a run in flight to report what the agent is doing right now, and the cost metrics to report what it has spent |
 | `grant-permissions.sh` | The `ExportSpans` and `ExportMetricsAndEvents` statements on the execution role |
 
 The ordering inside `app.py` is the part worth not breaking: artifacts →

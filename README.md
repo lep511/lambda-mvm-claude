@@ -529,22 +529,27 @@ agent/status.sh 20261008-122452  # a specific run, finished or not
 ```
 
 It reports the MicroVM's state, the run's log timeline, **how long is left
-before `CLAUDE_TIMEOUT` kills the attempt**, what has reached S3, and — from
-the spans ([`TELEMETRY.md`](TELEMETRY.md)) — what the agent is doing right now:
-turns taken, tool mix, tokens, which input files it has touched and which it
-has not, and its last command. With no id it picks the newest run whose
-`output/` has no `_status.json`, since that file is the lab's only completion
-signal. It is read-only: it launches nothing and terminates nothing.
+before `CLAUDE_TIMEOUT` kills the attempt**, **what it has cost in dollars so
+far**, what has reached S3, and — from the spans
+([`TELEMETRY.md`](TELEMETRY.md)) — what the agent is doing right now: turns
+taken, tool mix, tokens, which input files it has touched and which it has not,
+and its last command. With no id it picks the newest run without a
+`_status.json` *when a VM is actually alive*; otherwise it shows the most recent
+run and names any run that died before writing its status file. It is
+read-only: it launches nothing and terminates nothing.
 
 ```
 ==> run in flight: 20261008-122452 (newest without _status.json)
-    vm         microvm-6a32cbdc-…  state=RUNNING  image=3.0  up=18m
+    vm         microvm-6a32cbdc-…  state=RUNNING  image=4.0  up=18m
 ==> clock
     claude     running for 17m (since 12:25:44 UTC)
     deadline   12:50:44 UTC — 7m 4s left (CLAUDE_TIMEOUT=1500s)
 ==> agent activity (spans)
     turns      48 LLM round trip(s), 48 tool call(s)
     files      7/10 touched  pending: Order_Details.xlsx, Products.xlsx, employee_tables.xlsx
+==> cost
+    spend      $2.8097 USD so far
+    tokens     2379413 (all types; the span figures above are per-request)
 ```
 
 The rest is plain AWS CLI:
