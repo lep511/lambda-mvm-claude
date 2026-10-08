@@ -358,23 +358,41 @@ aws logs get-query-results --query-id "${QID}" --region "${AWS_REGION}"
 
 In the console: **CloudWatch → Metrics → All metrics → `ClaudeCodeAgent`**, then
 pick a dimension set — `agent.run_id` is one run, `agent.task` is one task
-across runs, `agent.model` compares models. From the CLI, the dollar figure for
-one run:
+across runs, `agent.model` compares models.
+
+From the CLI, use **Metrics Insights**, not `get-metric-statistics`. Claude Code
+publishes each datapoint with its full attribute set, which here is **17
+dimensions** (`agent.run_id`, `agent.task`, `app.version`, `effort`, `model`,
+`query_source`, `os.version`, `user.id`, …), and `get-metric-statistics` matches
+only an *exact, complete* dimension set — give it `agent.run_id` alone and it
+returns zero datapoints and no error, which looks exactly like telemetry that
+never arrived. Metrics Insights filters on one dimension:
 
 ```bash
-aws cloudwatch get-metric-statistics \
-  --namespace ClaudeCodeAgent --metric-name "claude_code.cost.usage" \
-  --dimensions Name=agent.run_id,Value=20261008-122452 \
+# the dollar figure for one run
+aws cloudwatch get-metric-data --region "${AWS_REGION}" \
   --start-time "$(date -u -d '2 hours ago' +%FT%TZ)" \
   --end-time "$(date -u +%FT%TZ)" \
-  --period 3600 --statistics Sum --region "${AWS_REGION}"
+  --metric-data-queries '[{
+    "Id": "cost",
+    "Period": 60,
+    "Expression": "SELECT SUM(\"claude_code.cost.usage\") FROM \"ClaudeCodeAgent\" WHERE \"agent.run_id\" = '"'"'20261008-132911'"'"'"
+  }]' --query 'MetricDataResults[0].Values'
+# [0.1944745, 1.363689, 0.31502949999999996]   -> $1.87 so far
 ```
 
-Swap `claude_code.cost.usage` for `claude_code.token.usage` and add
-`Name=type,Value=input` (or `output`, `cacheRead`, `cacheCreation`) for tokens.
-`claude_code.active_time.total` is where the run's wall clock went, and
-`claude_code.lines_of_code.count` with `Name=type,Value=added` is how much the
-agent actually wrote.
+Swap the metric and add `GROUP BY` for the breakdowns that matter:
+
+```sql
+SELECT SUM("claude_code.token.usage") FROM "ClaudeCodeAgent"
+  WHERE "agent.run_id" = '<run-id>' GROUP BY "type"     -- input/output/cacheRead/cacheCreation
+SELECT SUM("claude_code.cost.usage")  FROM "ClaudeCodeAgent" GROUP BY "agent.task"
+SELECT SUM("claude_code.active_time.total") FROM "ClaudeCodeAgent" WHERE "agent.run_id" = '<run-id>'
+```
+
+If you do want `get-metric-statistics`, get the whole dimension set first with
+`aws cloudwatch list-metrics --namespace ClaudeCodeAgent --metric-name
+"claude_code.cost.usage"` and pass every pair it returns.
 
 These are ordinary custom metrics, so they alarm and dashboard like any other —
 a workshop-sized use is an alarm on `claude_code.cost.usage` summed across the
@@ -521,6 +539,7 @@ In order, because each step depends on the one above it:
 | `Exporting failed ... ValidationException` or `404` | Transaction Search not enabled in this region, so the OTLP endpoint rejects the write | Step 2 above, in the region the run used |
 | `telemetry drained` shows `spans N/N` but `aws/spans` is empty | Enabled less than ~10 minutes ago, or you are querying a different region than the run | Wait, then re-query; the region is in the run's log group name and in `_status.json` |
 | `telemetry drained: ... metrics 0/0 ...` on a normal run | Metrics exporter off in that image, or the run was too short to cross one `OTEL_METRIC_EXPORT_INTERVAL` (10 s) | Check the image's `OTEL_METRICS_EXPORTER`; a run with at least one API call always produces cost datapoints |
+| `get-metric-statistics` returns no datapoints although the metric is listed | It matches only a complete dimension set, and these datapoints carry 17 dimensions | Query with Metrics Insights (`get-metric-data` + a `SELECT ... WHERE` expression), or pass every dimension `list-metrics` reports |
 | Namespace `ClaudeCodeAgent` exists but has no `agent.run_id` dimension | `resource_to_telemetry_conversion` disabled in `agent/otel-collector.yaml` | Re-enable it, or query by `service.name` instead and accept per-run attribution being gone |
 | `the log entry's timestamp is older than 14 days or more than 2 hours in the future` | CloudWatch Logs rejects the record, not a config problem — a VM whose clock is far off, or replayed data | Check the VM's clock; this is the one error here that is not IAM |
 | Query returns nothing for a run you can see in the console | Field name guessed rather than checked | `fields @message \| limit 1` and copy the real keys |
