@@ -11,14 +11,15 @@ every run. Rewrite that file and the same image does something else — no
 rebuild, no code change.
 
 `agent-prompt.md` is the **active** task. [`prompts/`](prompts) is the library
-it was promoted from, and both entries are real tasks this lab has run:
+it was promoted from:
 
 | | Produces | Needs |
 | --- | --- | --- |
-| [`prompts/xls-analysis.md`](prompts/xls-analysis.md) — spreadsheet analysis. **Currently active.** | `ANALYSIS.md` + one CSV per sheet under `csv/` | `xlsx2csv`, `openpyxl`, `xlrd` — installed by the agent, per run |
+| [`prompts/xls-analysis.md`](prompts/xls-analysis.md) — spreadsheet analysis. | `ANALYSIS.md` + one CSV per sheet under `csv/` | `xlsx2csv`, `openpyxl`, `xlrd` — installed by the agent, per run |
 | [`prompts/summary-docs.md`](prompts/summary-docs.md) — PDF summarisation. The task the lab shipped with. | one cross-referenced `SUMMARY.md` | `pdftotext`, `pdfinfo` — in the image (apt) |
+| [`prompts/csv-to-dynamodb.md`](prompts/csv-to-dynamodb.md) — loads each CSV into a single-table DynamoDB design. **Currently active.** | rows in `sales-table`, plus `LOAD-REPORT.md` and `rejected/*.csv` | `boto3` — installed by the agent; **and** a `dynamodb:BatchWriteItem` grant, which `grant-permissions.sh` does not add |
 
-Run either without promoting it — `./run-agent.sh --prompt
+Run any of them without promoting it — `./run-agent.sh --prompt
 prompts/summary-docs.md` — or make one the default by copying it over
 `agent-prompt.md`. Switching never needs a rebuild. (If you would rather not
 keep a copy of the active task at the lab root, point `PROMPT_FILE` at a library
