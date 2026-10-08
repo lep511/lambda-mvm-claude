@@ -415,17 +415,25 @@ aws logs tail /aws/claude-agent/events --since 1h \
   --log-stream-names 20261008-122452 --region "${AWS_REGION}"
 ```
 
+Each record is a JSON envelope: `body` is the event name on its own, and
+everything worth reading is under `attributes.*`, with the run's identity under
+`resource.attributes.*`. So the field names need the same backticks the span
+queries need, and `body` alone tells you nothing — if a query over this group
+returns rows whose only content is `claude_code.<something>`, see
+`raw_log` in the troubleshooting table below.
+
 In Logs Insights over `/aws/claude-agent/events`, the same discipline as with
 spans — dump one record first, then filter on what you actually see:
 
 ```
-fields @timestamp, @message
+fields @message
 | limit 1
 ```
 
 ```
 # the agent's own narration of a run: prompt, answers, tool results, in order
-fields @timestamp, event.name, @message
+fields @timestamp, `attributes.event.name`, `attributes.prompt`,
+       `attributes.response`, `attributes.tool_name`, `attributes.duration_ms`
 | filter @logStream = "20261008-122452"
 | sort @timestamp asc
 | limit 500
@@ -433,8 +441,8 @@ fields @timestamp, event.name, @message
 
 ```
 # every API error across all runs, newest first
-fields @timestamp, @logStream, @message
-| filter @message like /api_error/
+fields @timestamp, @logStream, `attributes.error`, `attributes.status_code`
+| filter `attributes.event.name` = "api_error"
 | sort @timestamp desc
 | limit 50
 ```
@@ -548,6 +556,7 @@ In order, because each step depends on the one above it:
 | `get-metric-statistics` returns no datapoints although the metric is listed | It matches only a complete dimension set, and these datapoints carry 17 dimensions | Query with Metrics Insights (`get-metric-data` + a `SELECT ... WHERE` expression), or pass every dimension `list-metrics` reports |
 | Namespace `ClaudeCodeAgent` exists but has no `agent.run_id` dimension | `resource_to_telemetry_conversion` disabled in `agent/otel-collector.yaml` | Re-enable it, or query by `service.name` instead and accept per-run attribution being gone |
 | `the log entry's timestamp is older than 14 days or more than 2 hours in the future` | CloudWatch Logs rejects the record, not a config problem — a VM whose clock is far off, or replayed data | Check the VM's clock; this is the one error here that is not IAM |
+| Events arrive, but every record is just `claude_code.user_prompt` / `claude_code.tool_result` with no content | `raw_log: true` on the `awscloudwatchlogs/events` exporter. It writes only the record's Body, and a Claude Code event's Body is its name — the prompt, `tool_name`, `duration_ms` and `prompt.id` are all attributes, and they are dropped. The content gates and the flush counters all look healthy, so nothing reports it | `raw_log: false` in `agent/otel-collector.yaml` (a rebuild). Earlier runs cannot be recovered — the attributes never left the VM |
 | Query returns nothing for a run you can see in the console | Field name guessed rather than checked | `fields @message \| limit 1` and copy the real keys |
 | `telemetry flush timed out after 25s; spans 0/1, metrics 0/1, logs ?/1, queued 1` | The collector accepted telemetry it could not settle — usually one of the 403s above, so it kept retrying. The line names which signal is stuck | Fix the cause; the VM still terminated, and the next run will be clean |
 | Telemetry for a very fast run is missing its tail | Should not happen — `app.py` drains all three signals before `TerminateMicrovm`, waiting out the collector's batch window first. If it does, the flush logged a warning; read it | Check for `collector telemetry endpoint unreachable` on :8888 |

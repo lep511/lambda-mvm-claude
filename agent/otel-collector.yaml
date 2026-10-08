@@ -86,9 +86,19 @@ exporters:
     region: ${env:MVM_TRACE_REGION}
     log_group_name: /aws/claude-agent/events
     log_stream_name: ${env:MVM_RUN_ID}
-    # The events carry prompt text and tool I/O, which is the point of them
-    # here; raw_log keeps the record body as emitted instead of wrapping it.
-    raw_log: true
+    # raw_log MUST stay false, and it is the whole event stream that rides on
+    # it. With raw_log: true the exporter writes ONLY the record's Body — and a
+    # Claude Code event's Body is nothing but its name. A whole run then lands
+    # as a few dozen lines reading `claude_code.tool_result`, with no prompt, no
+    # tool_name, no duration_ms, no prompt.id: every field an event is worth
+    # reading for lives in its ATTRIBUTES, which raw_log discards. It looks like
+    # working telemetry — the stream exists, the flush reports logs N/N — which
+    # is why this was wrong for four runs before anyone noticed.
+    #
+    # False wraps each record as JSON (body, attributes, resource, trace_id),
+    # which is what makes `attributes.*` queryable in Logs Insights and what
+    # lets an event join back to its span in aws/spans.
+    raw_log: false
 
 extensions:
   # Signing service is xray for traces. The two AWS exporters above sign
