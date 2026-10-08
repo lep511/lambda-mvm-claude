@@ -4,8 +4,9 @@ Task library entry: spreadsheet analysis. Two ways to use it —
   ./run-agent.sh --prompt prompts/xls-analysis.md    # this run only
   cp prompts/xls-analysis.md agent-prompt.md         # make it the default
 
-Needs the spreadsheet libraries in agent/requirements.txt (xlsx2csv, openpyxl,
-xlrd). Adding those is an image change and so a rebuild; this file is not.
+Needs no rebuild and nothing added to the image: the spreadsheet libraries it
+uses (xlsx2csv, openpyxl, xlrd) are named below and the agent installs them
+itself with uv, inside the VM. A task needing pandas is one more word here.
 
 Same contract as every task: the input is in INPUT_DIR, every artifact goes in
 OUTPUT_DIR. This one deliberately produces several, in a subdirectory.
@@ -34,14 +35,18 @@ There are **{{INPUT_COUNT}} file(s)** in `{{INPUT_DIR}}/`:
 
 ## Reading spreadsheets
 
-Three tools are installed, and they are not interchangeable:
+**No Python libraries are installed in this VM.** `python3` is the bare standard
+library, you are not root, and there is nothing to read `.xlsx` with until you
+install it — so the choice of tools is yours to make and yours to set up, with
+`uv`, which is installed for exactly this. These three are the ones that work on
+spreadsheets, and they are not interchangeable:
 
 ```bash
 # .xlsx / .xlsm — flat dump of every sheet, one CSV each (the fast path)
-xlsx2csv -a "{{INPUT_DIR}}/example.xlsx" extracted/example/
+uvx xlsx2csv -a "{{INPUT_DIR}}/example.xlsx" extracted/example/
 
 # .xlsx / .xlsm — structure: sheet names, dimensions, cell types, formulas
-python3 -c "
+uv run --with openpyxl python -c "
 import openpyxl
 wb = openpyxl.load_workbook('{{INPUT_DIR}}/example.xlsx', data_only=True)
 for ws in wb.worksheets:
@@ -49,7 +54,7 @@ for ws in wb.worksheets:
 "
 
 # .xls — the LEGACY binary format. openpyxl cannot read it; xlrd only reads it.
-python3 -c "
+uv run --with 'xlrd>=2.0' python -c "
 import xlrd
 bk = xlrd.open_workbook('{{INPUT_DIR}}/legacy.xls')
 for sh in bk.sheets():
@@ -57,13 +62,24 @@ for sh in bk.sheets():
 "
 ```
 
+`uvx` runs a command-line tool, `uv run --with` runs a script against libraries
+it installs on the fly; both cache, so the second call is fast. If you would
+rather have one environment for the whole job, build it once in the workspace —
+`uv venv .venv && uv pip install openpyxl 'xlrd>=2.0' xlsx2csv` — and use
+`.venv/bin/python` from then on. Add whatever else you judge useful; `pandas` is
+one `--with pandas` away. Two hard rules: **never** `uv pip install --system`
+(it needs root, and fails), and if an install fails, say so in the report rather
+than working around it with figures you did not compute.
+
 Work **one file at a time**. Put intermediate dumps and any scripts you write
 in `extracted/` in the workspace root — create it, and keep it out of
 `{{OUTPUT_DIR}}/`, which is for finished artifacts only.
 
-**Compute every figure with `python3`, never by reading rows yourself.** Totals,
+**Compute every figure with a script, never by reading rows yourself.** Totals,
 averages, counts, group-bys, min/max: write a short script, run it, and use its
 output. A number you eyeballed from a CSV dump is a number you have invented.
+The standard library (`csv`, `statistics`) is plenty for the arithmetic, so
+plain `python3` will do unless you decide otherwise.
 
 If a file cannot be opened at all, say so plainly in the report for that file
 and move on. Do **not** infer its contents from the filename.
@@ -109,6 +125,10 @@ and move on. Do **not** infer its contents from the filename.
    - where the files **contradict** each other
    - gaps: what this set does not cover
    - if the files are sequential (periods, versions), how the picture evolves
+
+6. **`## Herramientas utilizadas`** — one line naming the libraries and tools
+   you installed and what each was for, plus any install that failed. It is how
+   the next run of this task knows what it actually took.
 
 Finish by listing what you left in `{{OUTPUT_DIR}}/` and confirming each CSV has
 a header row and the row count claimed for it in the inventory table.

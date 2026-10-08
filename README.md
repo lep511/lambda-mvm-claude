@@ -1,4 +1,4 @@
-# claude-agent — Claude Code as an autonomous agent in a MicroVM
+# Claude Code as an autonomous agent in a MicroVM
 
 Drop files in `input/`, run one script, get the agent's work back in
 `output/<run-id>/`. The work is done by Claude Code running headless inside an
@@ -15,15 +15,20 @@ it was promoted from, and both entries are real tasks this lab has run:
 
 | | Produces | Needs |
 | --- | --- | --- |
-| [`prompts/xls-analysis.md`](prompts/xls-analysis.md) — spreadsheet analysis. **Currently active.** | `ANALYSIS.md` + one CSV per sheet under `csv/` | `xlsx2csv`, `openpyxl`, `xlrd` |
-| [`prompts/summary-docs.md`](prompts/summary-docs.md) — PDF summarisation. The task the lab shipped with. | one cross-referenced `SUMMARY.md` | `pdftotext`, `pdfinfo` |
+| [`prompts/xls-analysis.md`](prompts/xls-analysis.md) — spreadsheet analysis. **Currently active.** | `ANALYSIS.md` + one CSV per sheet under `csv/` | `xlsx2csv`, `openpyxl`, `xlrd` — installed by the agent, per run |
+| [`prompts/summary-docs.md`](prompts/summary-docs.md) — PDF summarisation. The task the lab shipped with. | one cross-referenced `SUMMARY.md` | `pdftotext`, `pdfinfo` — in the image (apt) |
 
 Run either without promoting it — `./run-agent.sh --prompt
 prompts/summary-docs.md` — or make one the default by copying it over
-`agent-prompt.md`. Both toolchains live in the image permanently, so switching
-never needs a rebuild. (If you would rather not keep a copy of the active task
-at the lab root, point `PROMPT_FILE` at a library file instead; it means the
-same thing to both scripts.)
+`agent-prompt.md`. Switching never needs a rebuild. (If you would rather not
+keep a copy of the active task at the lab root, point `PROMPT_FILE` at a library
+file instead; it means the same thing to both scripts.)
+
+**The image ships no Python libraries at all.** The agent reads its task, works
+out what it needs and installs it with [`uv`](https://docs.astral.sh/uv/) inside
+the VM — so the "Needs" column above is a property of the *prompt*, not of the
+image. See [the agent installs its own
+libraries](#the-agent-installs-its-own-libraries).
 
 ## What makes this different from module-2.1
 
@@ -33,6 +38,11 @@ calls a tool. Here the agent is given a **directory** and has to work it out
 itself: run `pdftotext`, read the output, decide what matters, write a file.
 That is what requires `--dangerously-skip-permissions`, and that flag is what
 makes the non-root user below necessary.
+
+What this lab borrows from that one is its telemetry: the same in-VM OTel
+collector, SigV4-forwarding Claude Code's spans to CloudWatch. It matters more
+here, because "what did it actually do" has a longer answer when the agent
+chose its own tools ([`TELEMETRY.md`](TELEMETRY.md)).
 
 ## Order of operations
 
@@ -49,7 +59,10 @@ There is no Lambda, no stack and no orchestrator: `run-agent.sh` launches the
 MicroVM itself and the agent shuts it down when it is finished.
 
 `input/` ships empty on purpose. Nothing else needs editing — in the workshop's
-code editor the required variables are already in `.bashrc`.
+code editor the required variables are already in `.bashrc`. Anywhere else, or
+to override a knob, copy `.env.example` to `.env` and export it into the
+terminal first: `set -a; source .env; set +a`
+([why](#loading-env-into-your-terminal)).
 
 A run id is a timestamp, and the whole job takes 2-10 minutes depending on how
 much input there is. The last line of a successful run is where the result
@@ -116,6 +129,53 @@ The file counts come from the runtime, not the caller, so a prompt cannot be
 told it was handed a different number of files than it was. A placeholder with
 no value is left as-is and logged as a warning — which is how a typo surfaces.
 
+### The agent installs its own libraries
+
+The image is Claude Code, `python3`, `uv`, and the few command-line tools that
+need root to install (`pdftotext`/`pdfinfo` from poppler, `git`, `aws`). What it
+does **not** carry is a single third-party Python library. The agent decides:
+
+```bash
+uvx xlsx2csv -a input/ventas.xlsx extracted/ventas/   # a CLI tool, one-off
+uv run --with openpyxl python inspect.py              # a script + its libraries
+uv venv .venv && uv pip install openpyxl 'xlrd>=2.0'  # one env for the whole job
+```
+
+This is the "the image does not know what the job is" rule applied to
+dependencies. Baking in `xlsx2csv`, `openpyxl` and `xlrd` would put three
+libraries in the image for one task — dead weight whenever the other one is
+active — and a task that wanted `pandas` would mean a rebuild. With the prompt
+naming what it needs and the agent installing it, a new task is a new *file*
+even when it needs a new library.
+
+Four details make it work, and each one is a way it could break:
+
+- **Outbound network.** `build-image.sh` launches the VM with the
+  `INTERNET_EGRESS` network connector, which is what lets `uv` reach PyPI at run
+  time. Remove it and every task fails on its first install, not just the ones
+  reading spreadsheets.
+- **The agent is not root** (see [below](#why-the-agent-runs-as-a-non-root-user)),
+  so `uv pip install --system` — which writes to `/usr/local/lib` — fails. Every
+  prompt says so; the working routes are `uvx`, `uv run --with`, and a venv in
+  the job workspace. The cache lands in `$HOME/.cache/uv`, which `app.py` points
+  at `/home/agent`, and dies with the VM.
+- **`python3` is deliberately bare.** `app.py` needs `boto3` to upload artifacts
+  and terminate the VM, and that one library lives in a venv at
+  `/opt/agent-runtime` which is off `PATH` and named only by the Dockerfile's
+  `CMD`. Installing it system-wide would have left `import boto3` quietly
+  working for the agent too — a dependency nobody declared, until the day it
+  moved.
+- **`UV_PYTHON_DOWNLOADS=never`**, so `uv` uses the 3.12 already in the image
+  rather than spending 30 seconds of a run's budget fetching its own.
+
+`agent/test-image.sh` asserts both that `uv` is present and that it *runs as the
+`agent` user* — a binary installed into root's home would otherwise surface as a
+task failing to import something, minutes and tokens into a run.
+
+The cost is a few seconds per install (cached within a run) and one more
+external dependency in the path of a job. The rule for `requirements.txt` is now
+narrow: it holds what `app.py` imports, nothing else.
+
 ### Making it do something else
 
 Add a file to `prompts/` and point `--prompt` at it:
@@ -134,14 +194,18 @@ EOF
 ```
 
 Same image, same script, different job — and that one needs no new tooling at
-all, because `pdftotext` is already in the image. What *does* need a rebuild:
+all, because `pdftotext` is already in the image. Nor would a task needing
+`pandas` or `pypdf`: name the library in the prompt, tell the agent to install
+it with `uv`, and the image never changes. What *does* need a rebuild:
 
 | Change | Rebuild? |
 | --- | --- |
 | The task (`agent-prompt.md`, or a new file via `--prompt`) | no — it is job input |
 | A placeholder value (`--var`, `AGENT_LANGUAGE`) | no |
-| A new Python library for the agent to use | yes — `agent/requirements.txt` |
-| A new system tool in the toolbox (`tesseract-ocr` for OCR, an npm package) | yes — `agent/Dockerfile` |
+| A new Python library for the agent to use | no — name it in the prompt, the agent installs it with `uv` |
+| A new system tool in the toolbox (`tesseract-ocr` for OCR, an npm package) | yes — `agent/Dockerfile`, because apt needs root |
+| A library `app.py` itself imports | yes — `agent/requirements.txt` |
+| Tracing on/off, or what spans carry (`AGENT_TRACING`, `OTEL_*`) | yes — but the IAM grant and Transaction Search behind it are account settings, no rebuild ([`TELEMETRY.md`](TELEMETRY.md)) |
 | Model, timeout, retries, memory | yes — baked env vars |
 | The runtime itself (`agent/app.py`) | yes |
 
@@ -246,9 +310,16 @@ them with `get_frozen_credentials()` and passes them as
 puts env vars first in its provider chain, so this works regardless of how the
 VM delivers them.
 
+The other knock-on effect is dependencies: an unprivileged agent cannot
+`apt-get install` anything, nor write to the system `site-packages`. That is the
+split described [above](#the-agent-installs-its-own-libraries) — apt packages
+baked into the image, Python libraries installed per run into space the `agent`
+user owns.
+
 `agent/test-image.sh` asserts on this directly: `/health` reports
-`claude_version_as_agent`, and a version string there means the gate cannot
-fire. It costs no Bedrock tokens, so run it before the first real job.
+`claude_version_as_agent` and `uv_version_as_agent`, and a version string in
+each means the root gate cannot fire and the agent can install what it needs.
+Both cost no Bedrock tokens, so run it before the first real job.
 
 ## IAM
 
@@ -263,25 +334,29 @@ Two sides, both verified against the account rather than assumed.
 one passed: it is the only workshop role with `bedrock:InvokeModel*`, and
 pointing this at `LambdaMicroVMExecutionRole-workshop` means a 403 from Bedrock
 partway through a run. Out of the box that role has only `s3:GetObject` on the
-artifacts bucket, so `grant-permissions.sh` adds the three things this lab
-needs, scoped to `claude-agent/*` where it can be:
+artifacts bucket, so `grant-permissions.sh` adds what this lab needs, scoped to
+`claude-agent/*` where it can be:
 
 | Grant | Why |
 | --- | --- |
 | `s3:ListBucket` | the agent is handed a prefix, not a key list |
 | `s3:PutObject` | the artifacts are the only thing that leaves the VM |
 | `lambda:TerminateMicrovm` | nothing else is watching, so the agent stops itself |
+| `xray:PutTraceSegments`, `xray:PutTelemetryRecords` | the in-VM collector signs spans as this role ([`TELEMETRY.md`](TELEMETRY.md)) |
+| `logs:*` on `/aws/claude-agent/*` (4 actions) | the same collector writes the cost metrics and the event stream through CloudWatch Logs |
 
 Skip that script and the symptoms are specific: no `ListBucket` gives "no input
 files found", no `PutObject` means the work happens and cannot be delivered,
-and no `TerminateMicrovm` leaves the VM idling until the `idlePolicy` window
-expires. `run-agent.sh` checks the last one explicitly after every run rather
-than assuming it worked.
+no `TerminateMicrovm` leaves the VM idling until the `idlePolicy` window
+expires, and no `xray:*` or `logs:*` leaves runs succeeding with a `403` from the
+collector and no telemetry. `run-agent.sh` checks the termination grant explicitly after every
+run rather than assuming it worked.
 
 ## Knobs
 
-`.env.example` is the full list, with the script that reads each one. The ones
-worth knowing about:
+`.env.example` is the full list, with the script that reads each one — and
+[loading it into your terminal](#loading-env-into-your-terminal) is a step of
+its own, because no script reads the file. The ones worth knowing about:
 
 **Launch-time**, so no rebuild: `PROMPT_FILE` (default `agent-prompt.md`, the
 same thing `--prompt` sets — always relative to `claude-agent/`, including when
@@ -300,6 +375,57 @@ of watching for a result).
 | `CLAUDE_TIMEOUT` | `1500` | Seconds for one `claude -p` run. Kept under the credentials' lifetime. A timeout is terminal and not retried. |
 | `CLAUDE_MAX_ATTEMPTS` | `3` | Retries on a non-zero exit from the CLI (transient Bedrock errors). |
 | `MVM_MEMORY_MIB` | `2048` | What modules 2, 2.1 and 3 run on (module 4's tenant app uses 1024). Raise to `4096` if the agent dies mid-run on a large input set. |
+| `AGENT_TRACING` | `1` | Claude Code telemetry to CloudWatch — traces, cost/token metrics and events. Sets both telemetry switches together; `0` builds an untraced image and `app.py` then skips the collector. [`TELEMETRY.md`](TELEMETRY.md). |
+| `AGENT_TRACING_DETAILED` | `0` | Adds the beta detailed spans: each request's new context, system prompt preview and model output. Opt-in because it takes over delivery of logs and traces and multiplies volume. |
+
+### Loading `.env` into your terminal
+
+**The scripts read the ambient environment; none of them parses `.env`.** That
+is deliberate — several values reference `$AWS_ACCOUNTID`, which only a shell
+expands, and every other lab in this workshop works the same way — but it means
+a `.env` you edited has no effect until you export it into the shell you run
+the scripts from. The symptom otherwise is a hard failure naming the missing
+variable, or worse, a run that quietly uses the default you meant to override.
+
+One file, two lines:
+
+```bash
+cp .env.example .env          # once, then edit it
+set -a; source .env; set +a   # export everything in it into this shell
+```
+
+`set -a` turns every assignment that follows into an export and `set +a` turns
+that back off. Both halves matter: without `set -a` you get shell variables that
+`./run-agent.sh` — a child process — never sees, and without `set +a` every
+variable you happen to assign later in that terminal is exported too. Check it
+landed before blaming a script:
+
+```bash
+echo "${AWS_REGION} | ${AWS_ACCOUNTID} | ${ARTIFACTS_BUCKET}"
+```
+
+It lasts as long as that terminal: a new tab, a reconnected code editor or a
+fresh SSH session starts clean and needs the two lines again. Append them to
+`~/.bashrc` (or `~/.zshrc`, the default shell on macOS) if you would rather not
+think about it. In the workshop's code editor the required variables are in
+`.bashrc` already, which is why `.env` is usually only for overriding a knob.
+
+Two things that bite:
+
+- **Exports persist; removing a line from `.env` does not unset anything.**
+  Changing a value and re-sourcing works, but *deleting* a line leaves the old
+  value exported for the life of that shell. `unset VAR`, or open a new
+  terminal. This is exactly the `IMAGE_VERSION` trap described above: once
+  exported, it pins every later run in that shell to a stale image.
+- **The file is sourced, not parsed**, so it is bash: `${AWS_ACCOUNTID}`
+  expands, `#` starts a comment, and a stray space around `=` or an unquoted
+  value containing spaces fails loudly on the `source` line instead of being
+  quietly skipped the way a dotenv parser would skip it.
+
+A shell other than bash or zsh is worth one note: `set -a` is POSIX
+(`allexport`), so the two lines work as-is in dash, ksh and zsh, but `fish`
+has neither `set -a` nor `source`-of-bash-syntax — run `bash` first and work
+from there, which is also what the scripts themselves need.
 
 ## What the two tasks tell the agent
 
@@ -312,27 +438,32 @@ cross-document synthesis. Two rules carry more weight than the shape:
 - Extract with `pdftotext -layout`, one document at a time, into `extracted/`
   — scratch space in the workspace root, so it is not mistaken for an artifact.
 - A PDF that yields no text is a scan, and there is no OCR in this VM. Say so
-  for that file instead of inferring content from its name.
+  for that file instead of inferring content from its name — and this is the one
+  gap the agent cannot close for itself, which the prompt tells it: the engine
+  is an apt package and it is not root.
 
 Adding OCR is one apt package (`tesseract-ocr`) in the Dockerfile if you ever
-need it — a toolbox change, so it needs a rebuild.
+need it — a toolbox change, so it needs a rebuild. A Python library would not.
 
 **`prompts/xls-analysis.md`** — the same discipline applied to numbers, which
 is where an LLM is weakest:
 
-- Compute every figure with `python3` and never by reading rows. A number you
+- Compute every figure with a script and never by reading rows. A number you
   eyeballed from a CSV dump is a number you invented.
 - Report data-quality problems instead of quietly fixing them — blank cells,
   duplicate rows, two spellings of one category, numbers stored as text — each
   named by sheet and cell.
-- `xlsx2csv` for the flat dump, `openpyxl` for structure and cell types, and
-  `xlrd` for the legacy binary `.xls` that `openpyxl` cannot open at all.
+- Install the reader you need: `uvx xlsx2csv` for the flat dump, `openpyxl` for
+  structure and cell types, and `xlrd` for the legacy binary `.xls` that
+  `openpyxl` cannot open at all. Each is named with what it is for, and the
+  report has to end with the list of what was actually installed — which is also
+  how you find out whether the agent agreed with the prompt's choice.
 
 The payoff is specific: given a spreadsheet with `'12500'` stored as text, it
 reported that the column total is 158 250 or 170 750 depending on whether the
 string is coerced, and named the cell.
 
-## Logs
+## Logs and traces
 
 There is one log group, because there is one moving part:
 
@@ -344,11 +475,79 @@ Everything the agent does lands there — which prompt it resolved, the input
 list, each `claude` attempt, the uploads, and the self-termination. A
 `_status.json` that never appears is explained in that group.
 
+One line in there is harmless and worth recognising:
+
+```
+HTTP 127.0.0.1 TLS handshake on plaintext port 9000 (151 bytes); answered 400 and closed
+```
+
+Port 9000 serves plain HTTP — the MicroVM proxy is what terminates TLS and
+forwards, which is why `run-agent.sh` can call `https://<endpoint>` — so a
+client aimed straight at the port (a browser tab, a `curl https://…:9000`, a
+scanner) gets a 400 and nothing else. The bytes never parse into a request, so
+no handler runs and no job state is touched. `app.py` collapses the whole
+handshake to that one line rather than letting `http.server` escape a
+ClientHello into the log group byte by byte. Note the address: the proxy
+delivers every call locally, so `127.0.0.1` does not mean the caller was.
+
+Logs tell you what the runtime did. What the *agent* did comes from the three
+signals Claude Code emits, which an OTel collector in the VM SigV4-signs into
+CloudWatch:
+
+| Signal | Answers | Lands in |
+| --- | --- | --- |
+| Traces | what it did, step by step — one span per interaction, Bedrock call and tool execution, with the command, its output and the prompt attached | `aws/spans` |
+| Metrics | what it cost — `claude_code.cost.usage` in USD, tokens by type, active time, lines of code | CloudWatch Metrics, `ClaudeCodeAgent` |
+| Events | what happened in order — `user_prompt`, `assistant_response`, `tool_result`, `api_error`, … | `/aws/claude-agent/events` |
+
+Everything carries `agent.run_id`, the same string as `output/<run-id>/`, so the
+three join to each other and to the artifacts. A run is also **one trace**, not
+one per turn: `app.py` mints a trace context, passes it to the agent as
+`TRACEPARENT` — which `claude -p` honours — and publishes the `claude_agent.run`
+root span itself, so the whole job appears as a single waterfall. The
+`trace_id` ends up in `_status.json`. And all three signals are drained before
+the VM terminates, so a run cannot outrun its own telemetry.
+
+It needs two one-time account steps (IAM grants and Transaction Search) and a
+rebuild to change. **[`TELEMETRY.md`](TELEMETRY.md)** covers enabling it, the
+queries per signal, what ends up in a span, and the failure mode where every run
+succeeds and nothing to look at ever appears.
+
 If `run-agent.sh` times out, the run is not lost: the agent is still working
 and still owns its VM. Re-fetch the result with `./run-agent.sh --fetch
 <run-id>`.
 
 ## Inspecting and cleaning up
+
+A run is silent while it works — `app.py` logs the start of `claude` and then
+nothing until the agent exits — so "is it stuck or is it thinking?" has its own
+command:
+
+```bash
+agent/status.sh                  # the run still in flight
+agent/status.sh 20261008-122452  # a specific run, finished or not
+```
+
+It reports the MicroVM's state, the run's log timeline, **how long is left
+before `CLAUDE_TIMEOUT` kills the attempt**, what has reached S3, and — from
+the spans ([`TELEMETRY.md`](TELEMETRY.md)) — what the agent is doing right now:
+turns taken, tool mix, tokens, which input files it has touched and which it
+has not, and its last command. With no id it picks the newest run whose
+`output/` has no `_status.json`, since that file is the lab's only completion
+signal. It is read-only: it launches nothing and terminates nothing.
+
+```
+==> run in flight: 20261008-122452 (newest without _status.json)
+    vm         microvm-6a32cbdc-…  state=RUNNING  image=3.0  up=18m
+==> clock
+    claude     running for 17m (since 12:25:44 UTC)
+    deadline   12:50:44 UTC — 7m 4s left (CLAUDE_TIMEOUT=1500s)
+==> agent activity (spans)
+    turns      48 LLM round trip(s), 48 tool call(s)
+    files      7/10 touched  pending: Order_Details.xlsx, Products.xlsx, employee_tables.xlsx
+```
+
+The rest is plain AWS CLI:
 
 ```bash
 # what runs exist, and what each one produced

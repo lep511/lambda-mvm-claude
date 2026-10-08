@@ -6,7 +6,9 @@ with. Two ways to use it —
   cp prompts/summary-docs.md agent-prompt.md         # make it the default
 
 Needs poppler-utils in the image (pdftotext/pdfinfo), which is already in the
-Dockerfile, so no rebuild is involved either way.
+Dockerfile, so no rebuild is involved either way. It is in the image because it
+is an apt package and the agent is unprivileged; Python libraries are NOT in the
+image and the agent installs those itself with uv.
 
 Same contract as every task: the input is in INPUT_DIR, every artifact goes in
 OUTPUT_DIR. This one produces a single SUMMARY.md.
@@ -40,6 +42,12 @@ pdfinfo  "{{INPUT_DIR}}/example.pdf"                      # pages, title, metada
 pdftotext -layout "{{INPUT_DIR}}/example.pdf" "extracted/example.txt"
 ```
 
+Those two are command-line tools baked into the image. **No Python library is**
+— `python3` here is the bare standard library — so if you want one (`pypdf` for
+page-level work, `pdfplumber` for tables), install it yourself with `uv`, which
+is here for that: `uv run --with pypdf python script.py`, or `uvx <tool>` for a
+command. Never `uv pip install --system`: it needs root and you are not root.
+
 Work **one document at a time**: extract it, read the text, write down what you
 learned, then move to the next. Put the intermediate `.txt` files in
 `extracted/` in the workspace root — create it, and keep it out of
@@ -48,9 +56,10 @@ read the extracted text in chunks rather than pulling the whole thing in at
 once.
 
 If a PDF yields little or no text, it is almost certainly a **scanned image**.
-There is no OCR in this VM, so you cannot read it. Say so plainly in the
-summary for that document and move on. Do **not** guess at its contents from
-the filename.
+There is no OCR in this VM and this is the one gap you cannot close yourself:
+the engine is an apt package (`tesseract-ocr`) and you are not root, so no
+amount of `uv` will get you there. Say so plainly in the summary for that
+document and move on. Do **not** guess at its contents from the filename.
 
 ## Rules that matter
 

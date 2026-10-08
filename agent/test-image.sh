@@ -150,8 +150,8 @@ mvm_curl() {
 }
 
 # ── 4. health ────────────────────────────────────────────────────────────────
-# Generous timeout: the first /health runs `claude --version` as the agent
-# user, which spawns a process.
+# Generous timeout: the first /health runs `claude --version` and `uv --version`
+# as the agent user, which spawns a process each (both are cached afterwards).
 echo "==> GET /health"
 RESP=$(mvm_curl GET /health)
 CODE=$(tail -n1 <<<"${RESP}")
@@ -174,10 +174,17 @@ jqf() { jq -r "$1" <<<"${BODY}" 2>/dev/null; }
   && pass "fallback agent-prompt.md baked into the image" \
   || fail "no baked agent-prompt.md — build-image.sh did not zip it"
 
-# Toolbox. Asserted on pdftotext because it is the one tool every version of
-# this image has carried; whether the ACTIVE task needs it depends on which
-# prompt is in play, so the rest are reported and left to the eye. The full
-# dict is echoed above — check it against what your task actually uses.
+# Toolbox. uv is asserted because the image ships NO Python libraries — every
+# task installs its own at run time — so a missing uv is not a degraded toolbox,
+# it is every task failing on its first import. pdftotext is asserted because it
+# is the one tool every version of this image has carried, and OCR-less PDF
+# reading cannot be installed around (apt, and the agent is not root). Whether
+# the ACTIVE task needs either depends on which prompt is in play, so the rest
+# are reported and left to the eye; the full dict is echoed above.
+[[ "$(jqf '.tools.uv')" == "true" && "$(jqf '.tools.uvx')" == "true" ]] \
+  && pass "uv and uvx present (the agent can install its own libraries)" \
+  || fail "uv missing — no task can install a Python library; rebuild the image"
+
 [[ "$(jqf '.tools.pdftotext')" == "true" ]] \
   && pass "pdftotext present (poppler-utils installed)" \
   || fail "pdftotext missing — prompts/summary-docs.md cannot read any PDF"
@@ -195,6 +202,59 @@ case "${CLAUDE_VER}" in
   *)
     pass "claude runs as the agent user (${CLAUDE_VER})" ;;
 esac
+
+# Same question for uv, and not redundant with .tools.uv above: that one only
+# says the binary exists for root. This says the user that does the installing
+# can execute it — the failure mode when uv lands somewhere root-only.
+UV_VER="$(jqf '.uv_version_as_agent')"
+case "${UV_VER}" in
+  error:*|exit\ *|""|null)
+    fail "uv did not run as the agent user: ${UV_VER}" ;;
+  *)
+    pass "uv runs as the agent user (${UV_VER})" ;;
+esac
+
+# Tracing (../TELEMETRY.md). Checked here because a missing collector or a
+# half-set pair of Claude Code switches changes nothing a run can observe: the
+# job succeeds, the artifacts arrive, and the trace simply never exists. Both
+# are image facts, so a failure means rebuild — or AGENT_TRACING=0 on purpose,
+# which turns both of these into an expected "off".
+TRACING="$(jqf '.tracing_enabled')"
+if [[ "${TRACING}" == "true" ]]; then
+  pass "tracing enabled (both Claude Code telemetry switches baked in)"
+  [[ "$(jqf '.tools["otelcol-contrib"]')" == "true" ]] \
+    && pass "otelcol-contrib present (spans can be signed and forwarded)" \
+    || fail "otelcol-contrib missing — every run would lose its trace; rebuild"
+
+  # All three signals, because they are independent and each one's absence is
+  # invisible in a successful run: no metrics exporter means no cost data ever,
+  # and nothing anywhere says so.
+  EXPORTERS="$(jqf '[.telemetry_config.exporters.traces, .telemetry_config.exporters.metrics, .telemetry_config.exporters.logs] | join(",")')"
+  [[ "${EXPORTERS}" == "otlp,otlp,otlp" ]] \
+    && pass "all three signals exported (traces, metrics, events)" \
+    || fail "exporters are ${EXPORTERS}, expected otlp,otlp,otlp — rebuild"
+
+  # The content gates. Without them the telemetry still flows and says nothing
+  # about what the agent actually did, which is the point of collecting it here.
+  GATES="$(jqf '[.telemetry_config.content | to_entries[] | select(.value == false) | .key] | join(", ")')"
+  [[ -z "${GATES}" ]] \
+    && pass "content gates on (prompts, responses, tool inputs and tool output)" \
+    || fail "content gates off: ${GATES} — rebuild, or accept redacted telemetry"
+
+  # The beta pair, which is only ever coherent as a pair.
+  DETAILED="$(jqf '.telemetry_config.detailed.enabled')"
+  DETAILED_EP="$(jqf '.telemetry_config.detailed.endpoint')"
+  if [[ "${DETAILED}" == "true" ]]; then
+    [[ -n "${DETAILED_EP}" && "${DETAILED_EP}" != "null" ]] \
+      && pass "detailed beta tracing on, delivering to ${DETAILED_EP}" \
+      || fail "ENABLE_BETA_TRACING_DETAILED without BETA_TRACING_ENDPOINT — logs and traces would go nowhere"
+  elif [[ -n "${DETAILED_EP}" && "${DETAILED_EP}" != "null" ]]; then
+    fail "BETA_TRACING_ENDPOINT set without ENABLE_BETA_TRACING_DETAILED — no detailed spans, and a confusing config"
+  fi
+else
+  echo "    NOTE: tracing_enabled=false — built with AGENT_TRACING=0, so no"
+  echo "          spans will reach CloudWatch (see ../TELEMETRY.md)"
+fi
 
 echo "    model=$(jqf '.model')  default_language=$(jqf '.default_language')"
 
@@ -323,4 +383,9 @@ fi
 echo ""
 echo "==> ${PASS} passed, ${FAIL} failed"
 echo "    logs: aws logs tail ${LOG_GROUP} --since 15m"
+# The run's own verdict on its telemetry: app.py logs "telemetry drained:"
+# right before it terminates the VM. Zero, or an absent line, is the thing to
+# chase in ../TELEMETRY.md rather than hunting an empty console.
+echo "    spans: aws logs filter-log-events --log-group-name ${LOG_GROUP} \\"
+echo "             --filter-pattern 'telemetry drained' --region ${AWS_REGION}"
 [[ "${FAIL}" -eq 0 ]] || exit 1

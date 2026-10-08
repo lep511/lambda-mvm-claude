@@ -1,0 +1,128 @@
+# OTel Collector config for the claude-agent MicroVM.
+#
+# Claude Code emits three signals (code.claude.com/docs/en/monitoring-usage,
+# saved in ../info-telemetry-claude-code.md). This collector takes all three off
+# the agent and signs them into CloudWatch, because Claude Code's own exporter
+# cannot SigV4-sign anything:
+#
+#   claude -p ──OTLP/http:4318──▶ otelcol-contrib ──┬─ traces  ─▶ X-Ray OTLP ─▶ aws/spans
+#                                                   ├─ metrics ─▶ EMF ─▶ CloudWatch Metrics
+#                                                   └─ logs    ─▶ CloudWatch Logs (events)
+#
+# Contrib, not core: sigv4auth, awsemf and awscloudwatchlogs are all contrib
+# components and the core build refuses a config that names them.
+#
+# MVM_TRACE_REGION and MVM_RUN_ID are set by app.py from the job payload, so the
+# image stays region-agnostic (the same reason AWS_REGION is not baked in) and
+# every signal is attributable to one run. ../TELEMETRY.md is the operator half.
+
+receivers:
+  otlp:
+    protocols:
+      # HTTP only. The sole client is Claude Code, which is pinned to
+      # http/protobuf in the Dockerfile; a gRPC listener would never be used.
+      # One receiver serves all three signals on /v1/traces, /v1/metrics and
+      # /v1/logs, which is why the image sets a single OTLP endpoint.
+      http:
+        endpoint: 127.0.0.1:4318
+
+processors:
+  # Short batch window on purpose: the agent calls TerminateMicrovm on itself
+  # seconds after the job finishes, and the collector's default timeout would
+  # let a run's last telemetry die with the VM. app.py also drains the three
+  # queues before terminating (flush_telemetry), which is what makes the
+  # window a performance choice rather than the only line of defence.
+  batch:
+    send_batch_size: 200
+    timeout: 2s
+
+exporters:
+  # ── traces ────────────────────────────────────────────────────────────────
+  # otlp_http, never otlp: the CloudWatch OTLP endpoints are HTTP/1.1 only.
+  #
+  # The type is `otlp_http` and not `otlphttp` because 0.162.0 logs
+  # `"otlphttp" alias is deprecated; use "otlp_http" instead` for the old
+  # spelling — a warning today and a collector that refuses to start on some
+  # later version, which in this image means every run silently losing its
+  # trace. The `/traces` suffix is just this instance's name.
+  otlp_http/traces:
+    traces_endpoint: https://xray.${env:MVM_TRACE_REGION}.amazonaws.com/v1/traces
+    compression: gzip
+    auth:
+      authenticator: sigv4auth/traces
+
+  # ── metrics ───────────────────────────────────────────────────────────────
+  # EMF rather than the CloudWatch OTLP metrics endpoint: embedded metric
+  # format goes through CloudWatch Logs with plain role credentials, which is
+  # the one auth path this VM is guaranteed to have (grant-permissions.sh).
+  #
+  # What lands here is what the lab is actually asked about: claude_code.cost.usage
+  # in USD and claude_code.token.usage by type, plus session, lines-of-code and
+  # active-time counters.
+  #
+  # NoDimensionRollup, and this is not a detail: the rollup options emit the
+  # same datapoint again under every subset of its dimensions, which multiplies
+  # custom-metric cost for no insight here — one run has one dimension set.
+  # resource_to_telemetry_conversion promotes the resource attributes app.py
+  # stamps (agent.run_id, agent.task, agent.model) to dimensions, which is what
+  # makes "what did THIS run cost" answerable. It is also the cardinality
+  # knob: each new run_id is a new metric stream, so turn it off before
+  # pointing this at a system that runs thousands of jobs.
+  awsemf/metrics:
+    region: ${env:MVM_TRACE_REGION}
+    namespace: ClaudeCodeAgent
+    log_group_name: /aws/claude-agent/metrics
+    log_stream_name: ${env:MVM_RUN_ID}
+    dimension_rollup_option: NoDimensionRollup
+    resource_to_telemetry_conversion:
+      enabled: true
+
+  # ── logs / events ─────────────────────────────────────────────────────────
+  # Claude Code's event stream: user_prompt, assistant_response, tool_result,
+  # tool_decision, api_request, api_error, subagent_completed, and the rest.
+  # One log stream per run, so Logs Insights over the group is "all runs" and
+  # a single stream is "this run".
+  awscloudwatchlogs/events:
+    region: ${env:MVM_TRACE_REGION}
+    log_group_name: /aws/claude-agent/events
+    log_stream_name: ${env:MVM_RUN_ID}
+    # The events carry prompt text and tool I/O, which is the point of them
+    # here; raw_log keeps the record body as emitted instead of wrapping it.
+    raw_log: true
+
+extensions:
+  # Signing service is xray for traces. The two AWS exporters above sign
+  # themselves through the SDK's credential chain, so they need no
+  # authenticator — only the OTLP exporter does.
+  sigv4auth/traces:
+    region: ${env:MVM_TRACE_REGION}
+    service: xray
+
+service:
+  # service.extensions, NOT service.telemetry.extensions — the latter is not a
+  # real config key and the collector fails to start on it.
+  extensions: [sigv4auth/traces]
+  telemetry:
+    metrics:
+      # app.py scrapes otelcol_exporter_sent_{spans,metric_points,log_records}
+      # here to confirm each signal shipped before it terminates the VM they
+      # came from.
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 127.0.0.1
+                port: 8888
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp_http/traces]
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [awsemf/metrics]
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [awscloudwatchlogs/events]

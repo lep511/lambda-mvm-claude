@@ -1,13 +1,15 @@
-# Python dependencies for the claude-agent MicroVM image. The Dockerfile
-# installs this file; adding a library here is an image change, so it needs a
-# rebuild (unlike editing agent-prompt.md, which is job input).
+# Python dependencies of the RUNTIME (app.py) — not of the agent.
+#
+# The Dockerfile installs this file into a venv at /opt/agent-runtime, which is
+# deliberately off PATH and is not the interpreter the agent gets when it types
+# `python3`. The agent's toolbox carries NO Python libraries at all: it decides
+# what it needs and installs it itself with uv, per run, inside the VM (see the
+# "Reading ..." section of any file in prompts/). That is the point — a task
+# that needs pandas is a prompt change, not an image change.
+#
+# So the rule for this file is narrow: add something here only if app.py
+# imports it. Anything the AGENT would import belongs in the prompt.
 
-# The lambda-microvms client, so the agent can terminate its own VM.
+# The lambda-microvms client, so the agent can terminate its own VM, plus S3
+# for input download and artifact upload. app.py's only third-party import.
 boto3>=1.43.0
-
-# Spreadsheet toolbox for prompts/xls-analysis.md. These are complementary, not
-# redundant: xlrd 2.x dropped .xlsx and reads ONLY the legacy binary .xls,
-# which openpyxl cannot open at all.
-xlsx2csv
-openpyxl
-xlrd>=2.0

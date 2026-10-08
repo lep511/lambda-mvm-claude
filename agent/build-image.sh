@@ -61,12 +61,39 @@ MVM_MEMORY_MIB="${MVM_MEMORY_MIB:-2048}"
 CLAUDE_TIMEOUT="${CLAUDE_TIMEOUT:-1500}"
 CLAUDE_MAX_ATTEMPTS="${CLAUDE_MAX_ATTEMPTS:-3}"
 
+# Claude Code session tracing -> in-VM otelcol -> CloudWatch (../TELEMETRY.md).
+# AGENT_TRACING=0 builds an untraced image: both Claude Code switches go off
+# together, which is also how app.py knows not to start the collector. One knob
+# rather than two, because one of the two on its own is the silent-failure
+# shape — instrumented-looking image, no spans.
+AGENT_TRACING="${AGENT_TRACING:-1}"
+
+# Detailed beta tracing, off by default. It adds the request's new context, the
+# system prompt preview and the model's output to the spans, and for `claude -p`
+# sessions it needs no org allowlisting — but it is a PAIR of variables, and
+# setting it moves delivery of logs AND traces to BETA_TRACING_ENDPOINT instead
+# of the configured exporters. That is why the endpoint is hard-coded to the
+# in-VM collector here rather than left to the caller: anywhere else and both
+# signals disappear with no error.
+AGENT_TRACING_DETAILED="${AGENT_TRACING_DETAILED:-0}"
+if [[ "${AGENT_TRACING_DETAILED}" == "1" && "${AGENT_TRACING}" != "1" ]]; then
+  echo "NOTE: ignoring AGENT_TRACING_DETAILED=1 because AGENT_TRACING=${AGENT_TRACING}"
+  echo "      (detailed tracing is an addition to telemetry, not a substitute)"
+  AGENT_TRACING_DETAILED=0
+fi
+
 # --environment-variables is a map, so it takes ONE comma-separated argument.
 MVM_ENV_VARS="CLAUDE_CODE_USE_BEDROCK=1"
 MVM_ENV_VARS+=",ANTHROPIC_MODEL=${ANTHROPIC_MODEL}"
 MVM_ENV_VARS+=",AGENT_LANGUAGE=${AGENT_LANGUAGE}"
 MVM_ENV_VARS+=",CLAUDE_TIMEOUT=${CLAUDE_TIMEOUT}"
 MVM_ENV_VARS+=",CLAUDE_MAX_ATTEMPTS=${CLAUDE_MAX_ATTEMPTS}"
+MVM_ENV_VARS+=",CLAUDE_CODE_ENABLE_TELEMETRY=${AGENT_TRACING}"
+MVM_ENV_VARS+=",CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=${AGENT_TRACING}"
+if [[ "${AGENT_TRACING_DETAILED}" == "1" ]]; then
+  MVM_ENV_VARS+=",ENABLE_BETA_TRACING_DETAILED=1"
+  MVM_ENV_VARS+=",BETA_TRACING_ENDPOINT=http://127.0.0.1:4318"
+fi
 
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
 S3_KEY="deployments/${IMAGE_NAME}-${TIMESTAMP}.zip"
@@ -99,8 +126,19 @@ fi
 # an exception" with no log — two minutes spent to learn nothing.
 if [[ ! -f requirements.txt ]]; then
   echo "ERROR: no requirements.txt next to the Dockerfile"
-  echo "It declares the image's Python dependencies, including boto3>=1.43.0,"
-  echo "without which the agent cannot terminate its own VM."
+  echo "It declares app.py's own dependencies, i.e. boto3>=1.43.0, without which"
+  echo "the runtime cannot upload artifacts or terminate its own VM. (The agent's"
+  echo "libraries are not in here — it installs those itself with uv, per run.)"
+  exit 1
+fi
+
+# Same reasoning for the collector config: the Dockerfile COPYs it, and without
+# it every run would succeed and silently lose its trace.
+if [[ ! -f otel-collector.yaml ]]; then
+  echo "ERROR: no otel-collector.yaml next to the Dockerfile"
+  echo "app.py starts otelcol-contrib with it to SigV4-forward Claude Code's"
+  echo "spans to CloudWatch. See ../TELEMETRY.md, or build without tracing:"
+  echo "    AGENT_TRACING=0 ./build-image.sh"
   exit 1
 fi
 
@@ -111,7 +149,19 @@ echo "    timeout    ${CLAUDE_TIMEOUT}s (max ${CLAUDE_MAX_ATTEMPTS} attempts)"
 # The resolved path, not the raw value: which file actually got baked in is the
 # thing you want in the log when a fallback task turns out to be the wrong one.
 echo "    prompt     ${PROMPT_PATH} (baked in as the fallback task)"
-echo "    pip        $(grep -cvE '^\s*(#|$)' requirements.txt) package(s) from requirements.txt"
+# The runtime's dependencies only, installed into the /opt/agent-runtime venv.
+# The agent's own libraries are not counted here and never were baked: it
+# installs them with uv during the run, which is why this number stays at 1.
+echo "    runtime    $(grep -cvE '^\s*(#|$)' requirements.txt) package(s) from requirements.txt (app.py's own; the agent installs its own with uv)"
+if [[ "${AGENT_TRACING}" == "1" ]]; then
+  if [[ "${AGENT_TRACING_DETAILED}" == "1" ]]; then
+    echo "    telemetry  traces + metrics + events, DETAILED spans (see ../TELEMETRY.md)"
+  else
+    echo "    telemetry  traces + metrics + events (see ../TELEMETRY.md)"
+  fi
+else
+  echo "    telemetry  OFF (AGENT_TRACING=${AGENT_TRACING}) — no signals, no collector"
+fi
 
 # The Dockerfile COPYs the prompt by a fixed name, so a PROMPT_FILE with any
 # other name is staged under that name rather than renamed in place.
@@ -121,7 +171,7 @@ trap 'rm -rf "${STAGE}"' EXIT
 cp "${PROMPT_PATH}" "${STAGE}/agent-prompt.md"
 
 rm -f claude-agent.zip
-zip -qr claude-agent.zip app.py Dockerfile requirements.txt
+zip -qr claude-agent.zip app.py Dockerfile requirements.txt otel-collector.yaml
 zip -qj claude-agent.zip "${STAGE}/agent-prompt.md"
 
 echo "==> uploading to s3://${ARTIFACTS_BUCKET}/${S3_KEY}"

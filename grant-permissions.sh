@@ -18,6 +18,20 @@
 #                            agent terminates itself when the job is done.
 #                            Without this it stays up until the idlePolicy
 #                            window expires and the account pays for the gap.
+#   xray:PutTraceSegments   — the in-VM OTel collector SigV4-signs Claude
+#   xray:PutTelemetryRecords  Code's spans to CloudWatch as this role. These
+#                            are the two actions the OTLP traces endpoint
+#                            authorizes against (AWS's managed equivalent is
+#                            AWSXrayWriteOnlyPolicy). Without them every run
+#                            still succeeds and delivers its artifacts, and
+#                            the collector logs "Exporting failed ... 403"
+#                            while no trace ever appears. See ./TELEMETRY.md.
+#   logs:* (4 actions)      — the other two signals. Claude Code's metrics go
+#                            to CloudWatch as embedded metric format and its
+#                            events go to a log group, and BOTH exporters write
+#                            through CloudWatch Logs — so cost, tokens and the
+#                            event stream all depend on these, scoped to the
+#                            two /aws/claude-agent/* groups.
 #
 # Additive and idempotent: it puts one inline policy on the role and touches
 # nothing common.yml manages. Remove it with
@@ -68,12 +82,38 @@ aws iam put-role-policy \
         \"Effect\": \"Allow\",
         \"Action\": [\"lambda:TerminateMicrovm\"],
         \"Resource\": \"*\"
+      },
+      {
+        \"Sid\": \"ExportSpans\",
+        \"Effect\": \"Allow\",
+        \"Action\": [\"xray:PutTraceSegments\", \"xray:PutTelemetryRecords\"],
+        \"Resource\": \"*\"
+      },
+      {
+        \"Sid\": \"ExportMetricsAndEvents\",
+        \"Effect\": \"Allow\",
+        \"Action\": [
+          \"logs:CreateLogGroup\",
+          \"logs:CreateLogStream\",
+          \"logs:PutLogEvents\",
+          \"logs:DescribeLogStreams\"
+        ],
+        \"Resource\": [
+          \"arn:aws:logs:*:${AWS_ACCOUNTID}:log-group:/aws/claude-agent/*\",
+          \"arn:aws:logs:*:${AWS_ACCOUNTID}:log-group:/aws/claude-agent/*:*\"
+        ]
       }
     ]
   }"
 
 echo "Done. ${ROLE_NAME} can now list, read and write under ${PREFIX}/,"
-echo "and terminate the MicroVM it runs in."
+echo "terminate the MicroVM it runs in, and export traces, metrics and events"
+echo "to CloudWatch."
 echo ""
 echo "Verify:"
 echo "  aws iam get-role-policy --role-name ${ROLE_NAME} --policy-name ${POLICY_NAME}"
+echo ""
+echo "Spans also need Transaction Search enabled once per account/region,"
+echo "which is an account setting rather than a role grant:"
+echo "  aws xray get-trace-segment-destination --region ${AWS_REGION:-<region>}"
+echo "See ./TELEMETRY.md for turning it on."
