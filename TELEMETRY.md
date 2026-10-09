@@ -1,6 +1,6 @@
 # Seeing what the agent did: tracing a run end to end
 
-Every run of this lab leaves evidence behind. Two kinds are obvious — the files
+Every run of this project leaves evidence behind. Two kinds are obvious — the files
 in `output/<run-id>/` and the agent's stdout in the MicroVM's log group. The
 rest is OpenTelemetry, and Claude Code emits **three signals** that answer three
 different questions:
@@ -64,23 +64,28 @@ single most confusing failure mode in this document, so do these first.
 ### 1. Let the execution role write telemetry
 
 ```bash
-./grant-permissions.sh
+./create-roles.sh
 ```
 
-It adds two statements to the MicroVM execution role, alongside the S3 and
-`TerminateMicrovm` grants the lab already needed:
+Two of the seven statements it puts on the MicroVM execution role exist only
+for telemetry:
 
 | Grant | For |
 | --- | --- |
 | `xray:PutTraceSegments`, `xray:PutTelemetryRecords` | Traces. These are the actions the OTLP traces endpoint authorizes against; AWS's managed equivalent is `AWSXrayWriteOnlyPolicy` |
 | `logs:CreateLogGroup`, `logs:CreateLogStream`, `logs:PutLogEvents`, `logs:DescribeLogStreams` on `/aws/claude-agent/*` | **Both** metrics and events — EMF metrics and the event stream are written through CloudWatch Logs, so cost data depends on these too |
 
+A third one is adjacent and worth knowing about: the same four `logs:*` actions
+on `/aws/lambda-microvms/*` carry the VM's own stdout, which is where
+`app.py`'s `telemetry drained` summary appears. Without it you lose the cheapest
+diagnostic for everything below.
+
 Verify:
 
 ```bash
 aws iam get-role-policy \
   --role-name "${MVM_EXECUTION_ROLE_ARN##*/}" \
-  --policy-name MicroVMClaudeAgentS3-workshop
+  --policy-name ClaudeAgentExecutionPolicy
 ```
 
 ### 2. Enable Transaction Search
@@ -167,7 +172,7 @@ agent/test-image.sh
 ### What the signals are allowed to carry
 
 Claude Code redacts every content-bearing attribute by default, and each kind
-has its own gate. For this lab the content *is* the product, so all four are on:
+has its own gate. For this project the content *is* the product, so all four are on:
 
 | Variable | What it adds | Where |
 | --- | --- | --- |
@@ -216,8 +221,8 @@ each other and to the rest of the evidence:
 
 | Attribute | Value | Why you care |
 | --- | --- | --- |
-| `service.name` | `mvm-claude-agent` | Separates this lab from the other modules in the same account |
-| `service.namespace` | `lambda-mvm-workshop` | |
+| `service.name` | `mvm-claude-agent` | Separates this project from anything else reporting into the same account |
+| `service.namespace` | `lambda-mvm-claude` | |
 | `deployment.environment.name` | `claude-agent` | |
 | `agent.run_id` | e.g. `20261008-002347` | **The join key.** Same string as `output/<run-id>/` and the run's S3 prefix |
 | `agent.task` | the prompt's source URI, or `image:agent-prompt.md` | Which task definition ran — the per-run upload or the baked fallback |
@@ -238,7 +243,7 @@ runs thousands of jobs, turn off `resource_to_telemetry_conversion` in
 `agent/otel-collector.yaml`.
 
 Spans, metrics and events all come from Claude Code's own instrumentation, named
-by the CLI rather than by this lab, and the span schema in particular is a beta
+by the CLI rather than by this project, and the span schema in particular is a beta
 feature whose attribute keys can change between CLI versions. So the first query
 below (dump one record) is worth more than any list this document could
 hard-code.
@@ -247,7 +252,7 @@ hard-code.
 
 Claude Code starts a new trace per interaction, which would make a 50-turn run
 50 unrelated traces. The document's way out is that in `claude -p` sessions —
-exactly what this lab runs — Claude Code **reads `TRACEPARENT` from its own
+exactly what this project runs — Claude Code **reads `TRACEPARENT` from its own
 environment** and parents each `claude_code.interaction` span under it, and
 stamps the same ids on the event records. So `app.py`:
 
@@ -286,7 +291,7 @@ useful starting filters:
 
 ```
 attributes.agent.run_id = 20261008-002347      # one run, every span
-resource.attributes.service.name = mvm-claude-agent   # this lab, all runs
+resource.attributes.service.name = mvm-claude-agent   # this project, all runs
 ```
 
 Click a `traceId` to get the waterfall: how long the agent spent thinking
@@ -321,7 +326,7 @@ fields @timestamp, name, attributes.agent.run_id
 ```
 
 ```
-# which tools the agent chose, across all runs of this lab
+# which tools the agent chose, across all runs of this project
 fields @timestamp, name, @message
 | filter `resource.attributes.service.name` = "mvm-claude-agent"
 | filter name like /tool/
@@ -401,7 +406,7 @@ of queries (1) exceeded", so cost and tokens are two calls), and if you do want
 dollar figure and the token total for a run, finished or in flight.
 
 These are ordinary custom metrics, so they alarm and dashboard like any other —
-a workshop-sized use is an alarm on `claude_code.cost.usage` summed across the
+a small-scale use is an alarm on `claude_code.cost.usage` summed across the
 namespace, which catches a prompt that has started looping long before the bill
 does.
 
@@ -522,7 +527,7 @@ In order, because each step depends on the one above it:
    content gates on. It reads them from `/health`'s `telemetry_config`, which
    is also where to look by hand when a rebuild changed something.
 2. **Role** — `aws iam get-role-policy ... --policy-name
-   MicroVMClaudeAgentS3-workshop` contains both the `ExportSpans` and the
+   ClaudeAgentExecutionPolicy` contains both the `ExportSpans` and the
    `ExportMetricsAndEvents` statements.
 3. **Account** — `aws xray get-trace-segment-destination` says
    `CloudWatchLogs` / `ACTIVE` (traces only; metrics and events need nothing
@@ -548,8 +553,8 @@ In order, because each step depends on the one above it:
 | `collector did not open :4318 (it exited with <rc> ...)` | The collector really failed: a bad `otel-collector.yaml`, or a missing one (the core build also refuses `sigv4auth`). Its own error is on the preceding lines | Read the collector's stderr in the log group; `otel-collector.yaml` must be in the zip (`build-image.sh` checks) |
 | `collector did not open :4318 (still not listening after 120s)` | Cold start slower than the budget — a very large input set competing for IO, or a smaller `MVM_MEMORY_MIB` | Rerun; if it repeats, raise `COLLECTOR_START_TIMEOUT` in `app.py` (a rebuild) rather than treating it as a crash |
 | Trace exists but starts mid-run, with the first tool calls missing | An older image that waited only 20 s for the collector and then ran ahead of it | Rebuild: the wait now overlaps the input download and runs right before `claude` |
-| `Exporting failed ... 403` / `AccessDenied` on `otlp_http/traces` | Execution role lacks the xray actions | `./grant-permissions.sh`, then rerun — no rebuild needed |
-| `Exporting failed ... AccessDenied` on `awsemf` or `awscloudwatchlogs` | Execution role lacks the CloudWatch Logs actions on `/aws/claude-agent/*`. Traces are unaffected, so you get a trace and no cost data | `./grant-permissions.sh`, then rerun |
+| `Exporting failed ... 403` / `AccessDenied` on `otlp_http/traces` | Execution role lacks the xray actions | `./create-roles.sh`, then rerun — no rebuild needed |
+| `Exporting failed ... AccessDenied` on `awsemf` or `awscloudwatchlogs` | Execution role lacks the CloudWatch Logs actions on `/aws/claude-agent/*`. Traces are unaffected, so you get a trace and no cost data | `./create-roles.sh`, then rerun |
 | `Exporting failed ... ValidationException` or `404` | Transaction Search not enabled in this region, so the OTLP endpoint rejects the write | Step 2 above, in the region the run used |
 | `telemetry drained` shows `spans N/N` but `aws/spans` is empty | Enabled less than ~10 minutes ago, or you are querying a different region than the run | Wait, then re-query; the region is in the run's log group name and in `_status.json` |
 | `telemetry drained: ... metrics 0/0 ...` on a normal run | Metrics exporter off in that image, or the run was too short to cross one `OTEL_METRIC_EXPORT_INTERVAL` (10 s) | Check the image's `OTEL_METRICS_EXPORTER`; a run with at least one API call always produces cost datapoints |
@@ -570,7 +575,7 @@ Three signals, three line items, and they scale differently:
 | Signal | Billed as | What drives it here |
 | --- | --- | --- |
 | Traces | Span ingestion, separate from log ingestion; Transaction Search switches all span ingestion into that mode account-wide. Indexing 1% is free and is what this document recommends — you still get every span in `aws/spans`, indexing only affects trace summaries | A few hundred spans per run, but the content gates make each one much bigger than a default span: **bytes, not span count** |
-| Metrics | Custom metrics, one per unique dimension set | `agent.run_id` as a dimension means one metric stream per run. Cheap for a workshop, a real number if you run thousands of jobs — the knob is `resource_to_telemetry_conversion` |
+| Metrics | Custom metrics, one per unique dimension set | `agent.run_id` as a dimension means one metric stream per run. Negligible at a handful of runs, a real number if you run thousands of jobs — the knob is `resource_to_telemetry_conversion` |
 | Events | CloudWatch Logs ingestion and storage | The same content gates: prompts, assistant text and tool output are the bulk |
 
 The cheapest way to cut volume without losing the shape of a run is to drop the
@@ -579,7 +584,7 @@ tool output is the largest of the four. `AGENT_TRACING_DETAILED=1` goes the
 other way and multiplies trace volume per request.
 
 A retention policy is worth setting on both log groups; neither has one by
-default, and nothing in this lab reads them after a run:
+default, and nothing in this project reads them after a run:
 
 ```bash
 for g in /aws/claude-agent/events /aws/claude-agent/metrics; do
@@ -600,7 +605,7 @@ done
 | `agent/build-image.sh` | `AGENT_TRACING` → both switches; `AGENT_TRACING_DETAILED` → the beta pair with the endpoint pinned to the in-VM collector; ships `otel-collector.yaml` in the zip and refuses to build without it |
 | `agent/test-image.sh` | Asserts the image can trace, costing no tokens |
 | `agent/status.sh` | Reads the spans of a run in flight to report what the agent is doing right now, and the cost metrics to report what it has spent |
-| `grant-permissions.sh` | The `ExportSpans` and `ExportMetricsAndEvents` statements on the execution role |
+| `create-roles.sh` | The `ExportSpans` and `ExportMetricsAndEvents` statements on the execution role |
 
 The ordering inside `app.py` is the part worth not breaking: artifacts →
 `_status.json` → **flush telemetry** → `TerminateMicrovm`. The status file comes

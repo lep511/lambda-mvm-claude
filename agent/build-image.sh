@@ -6,20 +6,43 @@
 # run, so changing what the agent does needs no rebuild — only changing the
 # toolbox (new apt package), the model, or a default below does.
 #
-# Prereqs (all pre-populated by the workshop's code editor bootstrap):
-#   AWS_REGION, AWS_ACCOUNTID, ARTIFACTS_BUCKET, MODULE2_REVIEWER_BUILD_ROLE_ARN
+# Prereqs, all from the environment (copy .env.example to .env and source it):
+#   AWS_REGION, AWS_ACCOUNTID, ARTIFACTS_BUCKET, MVM_BUILD_ROLE_ARN
+# ../create-roles.sh creates the bucket and the role, and prints these three.
 #
 # On success, persists AGENT_IMAGE_ARN to /etc/profile.d/claude-agent-image.sh
 # so every subsequent shell (and ../run-agent.sh) picks it up.
+#
+# Takes no flags. There is nothing to configure here that is not an environment
+# variable, because both this script and run-agent.sh have to agree on every one
+# of them.
 set -euo pipefail
 
 cd "$(dirname "$0")"
 
-: "${AWS_REGION:?AWS_REGION must be set (should be pre-populated by the workshop bootstrap)}"
-: "${AWS_ACCOUNTID:?AWS_ACCOUNTID must be set (should be pre-populated by the workshop bootstrap)}"
-: "${MODULE2_REVIEWER_BUILD_ROLE_ARN:?MODULE2_REVIEWER_BUILD_ROLE_ARN must be set (should be pre-populated by the workshop bootstrap)}"
+# Args before the env checks so --help works in a bare shell, like the other
+# scripts. An unknown flag is an ERROR rather than something to ignore: this
+# script's no-argument behaviour is "upload and build", so silently ignoring a
+# typo spends two minutes and burns an image version that is identical to the
+# one before it.
+for arg in "$@"; do
+  case "$arg" in
+    -h|--help) sed -n '2,20p' "$(basename "$0")" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "unknown flag: $arg (try --help)"; exit 2 ;;
+  esac
+done
 
-ARTIFACTS_BUCKET="${ARTIFACTS_BUCKET:-lambda-mvm-workshop-artifacts-${AWS_ACCOUNTID}}"
+: "${AWS_REGION:?AWS_REGION must be set. Copy ../.env.example to ../.env, fill it in, then: set -a; source .env; set +a}"
+: "${AWS_ACCOUNTID:?AWS_ACCOUNTID must be set. Copy ../.env.example to ../.env, fill it in, then: set -a; source .env; set +a}"
+
+ARTIFACTS_BUCKET="${ARTIFACTS_BUCKET:-lambda-mvm-claude-artifacts-${AWS_ACCOUNTID}}"
+
+# Role the lambda-microvms service assumes to build the image server-side. It
+# is NOT the role the VM later runs as — the build only reads the source zip and
+# writes build logs, so it is a separate, much smaller role (../create-roles.sh
+# creates both). Same default shape as MVM_EXECUTION_ROLE_ARN in run-agent.sh:
+# one variable per phase, so .env names each role exactly once.
+MVM_BUILD_ROLE_ARN="${MVM_BUILD_ROLE_ARN:-arn:aws:iam::${AWS_ACCOUNTID}:role/ClaudeAgentMicroVMBuildRole}"
 IMAGE_NAME="${IMAGE_NAME:-mvm-claude-agent}"
 
 # The version is NOT an input here: the service assigns it — 1.0 for a new
@@ -35,22 +58,23 @@ IMAGE_ID_ARN="arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNTID}:microvm-image:${IMAG
 #
 # That is not pedantry. .env is meant to be sourced with `set -a`, so a
 # PROMPT_FILE line there is exported into the shell and read by both scripts —
-# but run-agent.sh cd's to the lab root while this script cd's to agent/, so a
+# but run-agent.sh cd's to the project root while this script cd's to agent/, so a
 # bare relative path would resolve to two different files and one of them would
 # not exist. One variable, one meaning.
-LAB_ROOT="$(cd .. && pwd)"
+PROJECT_ROOT="$(cd .. && pwd)"
 PROMPT_FILE="${PROMPT_FILE:-agent-prompt.md}"
 
 # Claude Code uses Bedrock via IAM role credentials — no API key needed.
-# The execution role attached to the MicroVM has bedrock:InvokeModel*.
+# The execution role attached to the MicroVM at RUN time carries
+# bedrock:InvokeModel*; the build role below does not need it.
 ANTHROPIC_MODEL="${ANTHROPIC_MODEL:-us.anthropic.claude-opus-5}"
 
 # Default for the prompt's {{LANGUAGE}} placeholder. A run can override it
 # without rebuilding: ../run-agent.sh --var LANGUAGE=en
 AGENT_LANGUAGE="${AGENT_LANGUAGE:-es}"
 
-# 2048 MiB is the value every other lab in this workshop runs on. Node plus a
-# large input set can want more; raise this if the agent dies mid-run. Both
+# 2048 MiB fits Node, Claude Code and whatever the agent installs with uv. Node
+# plus a large input set can want more; raise this if the agent dies mid-run. Both
 # prompts in prompts/ work one file at a time, so their peak stays bounded.
 MVM_MEMORY_MIB="${MVM_MEMORY_MIB:-2048}"
 
@@ -103,7 +127,7 @@ case "${PROMPT_FILE}" in
   # Lab root first — that is the canonical meaning. This script's own directory
   # second, so an older exported '../agent-prompt.md' still resolves instead of
   # becoming a confusing failure.
-  *)  CANDIDATES=("${LAB_ROOT}/${PROMPT_FILE}" "${PROMPT_FILE}") ;;
+  *)  CANDIDATES=("${PROJECT_ROOT}/${PROMPT_FILE}" "${PROMPT_FILE}") ;;
 esac
 
 PROMPT_PATH=""
@@ -115,7 +139,7 @@ if [[ -z "${PROMPT_PATH}" ]]; then
   echo "ERROR: no prompt file for PROMPT_FILE=${PROMPT_FILE}"
   echo "Looked in:"
   for candidate in "${CANDIDATES[@]}"; do echo "    ${candidate}"; done
-  echo "PROMPT_FILE is relative to the lab root (claude-agent/), the same as it"
+  echo "PROMPT_FILE is relative to the project root, the same as it"
   echo "is for run-agent.sh. For example:"
   echo "    PROMPT_FILE=prompts/xls-analysis.md ./build-image.sh"
   exit 1
@@ -146,6 +170,9 @@ echo "==> model      ${ANTHROPIC_MODEL}"
 echo "    language   ${AGENT_LANGUAGE} (default; overridable per run)"
 echo "    memory     ${MVM_MEMORY_MIB} MiB"
 echo "    timeout    ${CLAUDE_TIMEOUT}s (max ${CLAUDE_MAX_ATTEMPTS} attempts)"
+# Printed for the same reason run-agent.sh prints the execution role: a value
+# left exported by an earlier .env is otherwise invisible until the build fails.
+echo "    build role ${MVM_BUILD_ROLE_ARN}"
 # The resolved path, not the raw value: which file actually got baked in is the
 # thing you want in the log when a fallback task turns out to be the wrong one.
 echo "    prompt     ${PROMPT_PATH} (baked in as the fallback task)"
@@ -184,7 +211,7 @@ aws s3 cp claude-agent.zip "s3://${ARTIFACTS_BUCKET}/${S3_KEY}" \
 IMAGE_ARGS=(
   --code-artifact "uri=s3://${ARTIFACTS_BUCKET}/${S3_KEY}"
   --base-image-arn "arn:aws:lambda:${AWS_REGION}:aws:microvm-image:al2023-1"
-  --build-role-arn "${MODULE2_REVIEWER_BUILD_ROLE_ARN}"
+  --build-role-arn "${MVM_BUILD_ROLE_ARN}"
   --environment-variables "${MVM_ENV_VARS}"
   --region "${AWS_REGION}"
   --hooks '{"port":9000,"microvmHooks":{"run":"ENABLED","runTimeoutInSeconds":5,"terminate":"ENABLED","terminateTimeoutInSeconds":5},"microvmImageHooks":{"ready":"ENABLED","readyTimeoutInSeconds":60}}'
@@ -202,7 +229,7 @@ image_state() {
 
 # An update is only accepted from a settled state; mid-transition it fails with
 # "Cannot update MicroVM Image in its current state". Waiting is better than
-# handing that error to a participant who just edited a Dockerfile. Note that a
+# handing that error to someone who just edited a Dockerfile. Note that a
 # *create* that collides on the name has been seen to leave the existing image
 # in DELETING, which is the other reason not to call create blindly.
 STATE_NOW="$(image_state)"

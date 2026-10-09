@@ -2,18 +2,19 @@
 #
 # A task-agnostic agent runtime: the image is Claude Code plus a toolbox, and
 # the job it performs comes from agent-prompt.md, which run-agent.sh uploads
-# with every run. Unlike module-2.1's reviewer, which pastes a diff into the
-# prompt and gets a one-shot answer, this agent is handed a DIRECTORY and has
-# to work it out itself — so it actually calls tools (Bash/Read/Write).
+# with every run. The agent is handed a DIRECTORY rather than a question, and
+# has to work it out itself — so it actually calls tools (Bash/Read/Write),
+# which is what makes --dangerously-skip-permissions (and the non-root `agent`
+# user below) necessary.
 #
 # app.py returns 202 from POST /run, runs the agent in a background thread,
 # uploads whatever it left in the workspace's output/, and then calls
 # TerminateMicrovm on itself. There is no orchestrator.
 #
-# Deliberately kept structurally identical to
-# module-2.1-claude-code/reviewer-claude/Dockerfile, which is known to build.
-# The only differences are: poppler-utils in the apt list, the non-root `agent`
-# user, this lab's ENV block, and no OpenTelemetry collector.
+# The layer order below is the one known to build on this base image. It is not
+# arbitrary — apt before the aarch64 AWS CLI, uv before Node, otelcol last — so
+# reordering it to look tidier is how a build that worked yesterday stops
+# resolving. Change one layer at a time.
 
 FROM python:3.12-slim
 
@@ -25,6 +26,12 @@ FROM python:3.12-slim
 # the Read tool's document path is unreliable through Bedrock, and piping a whole
 # PDF into the context burns it for no benefit. Adding another such tool (OCR is
 # one package, tesseract-ocr) is an image change and needs a rebuild.
+#
+# The whole package, not a narrower one: the same poppler also provides
+# `pdftoppm`, which is how prompts/summary-docs.md handles a scanned PDF — it
+# renders the pages to PNG and has the model read them, so the image needs no
+# OCR engine. /health reports pdftotext and the smoke test asserts it; that
+# stands in for pdftoppm, since one package either arrived or it did not.
 #
 # Python libraries are the opposite case, and they are deliberately NOT here:
 # the agent installs its own with uv at run time. Nothing in requirements.txt is
@@ -150,7 +157,7 @@ RUN useradd --create-home --shell /bin/bash agent
 
 # Claude Code -> Amazon Bedrock. Credentials come from the MicroVM execution
 # role at runtime (no API key is baked in). AWS_REGION is intentionally NOT
-# pinned here because the workshop is multi-region; app.py sets it per request
+# pinned here, so one image can run in any region; app.py sets it per request
 # from the incoming job payload.
 ENV CLAUDE_CODE_USE_BEDROCK=1
 ENV ANTHROPIC_MODEL=us.anthropic.claude-opus-5

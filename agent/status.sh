@@ -37,10 +37,10 @@ for arg in "$@"; do
   esac
 done
 
-: "${AWS_REGION:?AWS_REGION must be set (should be pre-populated by the workshop bootstrap)}"
-: "${AWS_ACCOUNTID:?AWS_ACCOUNTID must be set (should be pre-populated by the workshop bootstrap)}"
+: "${AWS_REGION:?AWS_REGION must be set. Copy ../.env.example to ../.env, fill it in, then: set -a; source .env; set +a}"
+: "${AWS_ACCOUNTID:?AWS_ACCOUNTID must be set. Copy ../.env.example to ../.env, fill it in, then: set -a; source .env; set +a}"
 
-ARTIFACTS_BUCKET="${ARTIFACTS_BUCKET:-lambda-mvm-workshop-artifacts-${AWS_ACCOUNTID}}"
+ARTIFACTS_BUCKET="${ARTIFACTS_BUCKET:-lambda-mvm-claude-artifacts-${AWS_ACCOUNTID}}"
 IMAGE_NAME="${IMAGE_NAME:-mvm-claude-agent}"
 LOG_GROUP="/aws/lambda-microvms/${IMAGE_NAME}"
 RUNS_PREFIX="claude-agent/runs"
@@ -50,8 +50,9 @@ CLAUDE_TIMEOUT="${CLAUDE_TIMEOUT:-1500}"
 SPANS_LOG_GROUP="aws/spans"
 
 now_ms() { echo $(( $(date +%s) * 1000 )); }
-# Local time, because every other timestamp a participant sees (the log group,
-# the run id) is in the VM's clock, which is UTC in this workshop.
+# UTC, because every other timestamp on screen (the log group, the run id) is
+# in the VM's clock, which is UTC. Mixing the two is how a run looks like it
+# started hours ago.
 fmt_ms() { date -u -d "@$(( $1 / 1000 ))" +"%H:%M:%S"; }
 
 # ── 1. which run ─────────────────────────────────────────────────────────────

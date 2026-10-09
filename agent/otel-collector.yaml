@@ -54,7 +54,7 @@ exporters:
   # ── metrics ───────────────────────────────────────────────────────────────
   # EMF rather than the CloudWatch OTLP metrics endpoint: embedded metric
   # format goes through CloudWatch Logs with plain role credentials, which is
-  # the one auth path this VM is guaranteed to have (grant-permissions.sh).
+  # the one auth path this VM is guaranteed to have (create-roles.sh).
   #
   # What lands here is what the lab is actually asked about: claude_code.cost.usage
   # in USD and claude_code.token.usage by type, plus session, lines-of-code and

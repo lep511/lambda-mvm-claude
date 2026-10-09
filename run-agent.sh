@@ -11,8 +11,8 @@
 # ./output/<run-id>/. Nothing else leaves the VM.
 #
 # Prereqs:
-#   AWS_REGION, AWS_ACCOUNTID            (workshop bootstrap)
-#   ./grant-permissions.sh               (once per account)
+#   AWS_REGION, AWS_ACCOUNTID            (from .env, sourced into the shell)
+#   ./create-roles.sh                    (once per account: bucket + two roles)
 #   agent/build-image.sh                 (the MicroVM image)
 #
 # Usage:
@@ -61,8 +61,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-: "${AWS_REGION:?AWS_REGION must be set (should be pre-populated by the workshop bootstrap)}"
-: "${AWS_ACCOUNTID:?AWS_ACCOUNTID must be set (should be pre-populated by the workshop bootstrap)}"
+: "${AWS_REGION:?AWS_REGION must be set. Copy .env.example to .env, fill it in, then: set -a; source .env; set +a}"
+: "${AWS_ACCOUNTID:?AWS_ACCOUNTID must be set. Copy .env.example to .env, fill it in, then: set -a; source .env; set +a}"
 
 # Pull in AGENT_IMAGE_ARN if this shell was open before build-image.sh ran.
 if [[ -f /etc/profile.d/claude-agent-image.sh ]]; then
@@ -70,7 +70,7 @@ if [[ -f /etc/profile.d/claude-agent-image.sh ]]; then
   source /etc/profile.d/claude-agent-image.sh
 fi
 
-ARTIFACTS_BUCKET="${ARTIFACTS_BUCKET:-lambda-mvm-workshop-artifacts-${AWS_ACCOUNTID}}"
+ARTIFACTS_BUCKET="${ARTIFACTS_BUCKET:-lambda-mvm-claude-artifacts-${AWS_ACCOUNTID}}"
 IMAGE_NAME="${IMAGE_NAME:-mvm-claude-agent}"
 
 # What build-image.sh last built WINS over an ambient IMAGE_VERSION, and the
@@ -101,10 +101,11 @@ if [[ -n "${AGENT_LANGUAGE:-}" ]]; then
     'if has("LANGUAGE") then . else .LANGUAGE = $v end' <<<"${VARS_JSON}")
 fi
 
-# The MicroVM runs as this role: the only workshop role with
-# bedrock:InvokeModel*, and the one grant-permissions.sh adds S3 and
-# TerminateMicrovm to.
-MVM_EXECUTION_ROLE_ARN="${MVM_EXECUTION_ROLE_ARN:-arn:aws:iam::${AWS_ACCOUNTID}:role/Module2ReviewerBuildRole-workshop}"
+# The MicroVM runs as this role, and it is NOT the role that built the image.
+# The /run hook executes under the execution role, so everything the agent does
+# — Bedrock, the job's S3 prefix, terminating its own VM, exporting the three
+# telemetry signals — is authorised here. ./create-roles.sh creates it.
+MVM_EXECUTION_ROLE_ARN="${MVM_EXECUTION_ROLE_ARN:-arn:aws:iam::${AWS_ACCOUNTID}:role/ClaudeAgentMicroVMExecutionRole}"
 
 # Backstop for a VM that crashes before it can terminate itself. The agent
 # receives no inbound request while it works, so this window has to outlast a
@@ -115,7 +116,7 @@ MVM_MAX_IDLE_SECONDS="${MVM_MAX_IDLE_SECONDS:-1800}"
 POLL_ATTEMPTS="${POLL_ATTEMPTS:-150}"
 
 # Local directories. Absolute, because the paths are printed for the
-# participant to open or copy and the script has already cd'd into its own
+# caller to open or copy and the script has already cd'd into its own
 # directory — a relative path would be wrong from wherever they invoked it.
 INPUT_DIR="$(pwd)/input"
 OUTPUT_DIR="$(pwd)/output"
@@ -409,7 +410,7 @@ case "${FINAL}" in
     echo "    microvm ${FINAL,,} (agent shut itself down)" ;;
   *)
     echo "    WARNING: microvm is still ${FINAL} — self-termination did not happen."
-    echo "    Check that grant-permissions.sh granted lambda:TerminateMicrovm."
+    echo "    Check that create-roles.sh granted lambda:TerminateMicrovm."
     if [[ "${KEEP}" -eq 0 ]]; then
       echo "    terminating it now"
       aws lambda-microvms terminate-microvm \
@@ -421,5 +422,5 @@ echo "    agent logs: aws logs tail ${LOG_GROUP} --since 30m"
 
 if [[ "${rc}" -ne 0 ]]; then exit "${rc}"; fi
 
-# Last line of a successful run: the thing the participant actually came for.
+# Last line of a successful run: the thing the caller actually came for.
 report_path

@@ -16,13 +16,12 @@ it was promoted from:
 | | Produces | Needs |
 | --- | --- | --- |
 | [`prompts/xls-analysis.md`](prompts/xls-analysis.md) — spreadsheet analysis. | `ANALYSIS.md` + one CSV per sheet under `csv/` | `xlsx2csv`, `openpyxl`, `xlrd` — installed by the agent, per run |
-| [`prompts/summary-docs.md`](prompts/summary-docs.md) — PDF summarisation. The task the lab shipped with. | one cross-referenced `SUMMARY.md` | `pdftotext`, `pdfinfo` — in the image (apt) |
-| [`prompts/csv-to-dynamodb.md`](prompts/csv-to-dynamodb.md) — loads each CSV into a single-table DynamoDB design. **Currently active.** | rows in `sales-table`, plus `LOAD-REPORT.md` and `rejected/*.csv` | `boto3` — installed by the agent; **and** a `dynamodb:BatchWriteItem` grant, which `grant-permissions.sh` does not add |
+| [`prompts/summary-docs.md`](prompts/summary-docs.md) — PDF summarisation. The task this project ships with. **Currently active.** | one cross-referenced `SUMMARY.md` | `pdftotext`, `pdfinfo` — in the image (apt) |
 
 Run any of them without promoting it — `./run-agent.sh --prompt
 prompts/summary-docs.md` — or make one the default by copying it over
 `agent-prompt.md`. Switching never needs a rebuild. (If you would rather not
-keep a copy of the active task at the lab root, point `PROMPT_FILE` at a library
+keep a copy of the active task at the project root, point `PROMPT_FILE` at a library
 file instead; it means the same thing to both scripts.)
 
 **The image ships no Python libraries at all.** The agent reads its task, works
@@ -31,39 +30,49 @@ the VM — so the "Needs" column above is a property of the *prompt*, not of the
 image. See [the agent installs its own
 libraries](#the-agent-installs-its-own-libraries).
 
-## What makes this different from module-2.1
+## Why the agent gets a directory, not a question
 
-`module-2.1-claude-code/` also runs Claude Code in a MicroVM, but it pastes the
-whole git diff *into the prompt* — so Claude answers in one shot and never
-calls a tool. Here the agent is given a **directory** and has to work it out
-itself: run `pdftotext`, read the output, decide what matters, write a file.
-That is what requires `--dangerously-skip-permissions`, and that flag is what
-makes the non-root user below necessary.
+The usual way to put an LLM in a pipeline is to paste the material *into the
+prompt* and take the one-shot answer. Here the agent is given a **directory**
+and has to work it out itself: run `pdftotext`, read the output, decide what
+matters, write a file. That is what requires
+`--dangerously-skip-permissions`, and that flag is what makes the non-root user
+below necessary.
 
-What this lab borrows from that one is its telemetry: the same in-VM OTel
-collector, SigV4-forwarding Claude Code's spans to CloudWatch. It matters more
-here, because "what did it actually do" has a longer answer when the agent
-chose its own tools ([`TELEMETRY.md`](TELEMETRY.md)).
+It is also why the telemetry matters more than it would otherwise: "what did it
+actually do" has a longer answer when the agent chose its own tools. An in-VM
+OTel collector SigV4-forwards Claude Code's spans, cost metrics and events to
+CloudWatch ([`TELEMETRY.md`](TELEMETRY.md)).
 
 ## Order of operations
 
 ```bash
-./grant-permissions.sh            # once per account: S3 + TerminateMicrovm for the exec role
+cp .env.example .env              # fill in AWS_ACCOUNTID, then:
+set -a; source .env; set +a       # export it into this shell — no script reads the file
+
+./create-roles.sh                 # once per account: artifacts bucket + the two IAM roles
 agent/build-image.sh              # builds the MicroVM image (~90-120s)
 agent/test-image.sh               # smoke test — spends no Bedrock tokens
 
-cp /path/to/*.xlsx input/         # whatever the active task expects
+cp /path/to/*.pdf input/          # whatever the active task expects
 ./run-agent.sh                    # launch → run → wait → output/<run-id>/
 ```
 
 There is no Lambda, no stack and no orchestrator: `run-agent.sh` launches the
 MicroVM itself and the agent shuts it down when it is finished.
 
-`input/` ships empty on purpose. Nothing else needs editing — in the workshop's
-code editor the required variables are already in `.bashrc`. Anywhere else, or
-to override a knob, copy `.env.example` to `.env` and export it into the
-terminal first: `set -a; source .env; set +a`
-([why](#loading-env-into-your-terminal)).
+Two prerequisites are account settings that no script can do for you, and
+neither is on the path of a run that *looks* like it worked:
+
+- **Bedrock model access** for `$ANTHROPIC_MODEL` in your region. IAM allows
+  the call; the account still has to have the model enabled. The symptom is a
+  run that works for minutes and then fails inside `claude -p`.
+- **Transaction Search**, if you want traces — one setting per account and
+  region. Without it runs succeed and deliver artifacts, and there is simply
+  nothing to look at ([`TELEMETRY.md`](TELEMETRY.md)).
+
+`input/` ships empty on purpose. Nothing else needs editing: `.env`'s defaults
+match what `./create-roles.sh` creates.
 
 A run id is a timestamp, and the whole job takes 2-10 minutes depending on how
 much input there is. The last line of a successful run is where the result
@@ -73,10 +82,10 @@ the directory:
 
 ```
 Result saved to:
-  /home/ec2-user/lambda-mvm-workshop/claude-agent/output/20261007-230145/SUMMARY.md
+  /path/to/lambda-mvm-claude/output/20261007-230145/SUMMARY.md
 
 Results saved to:
-  /home/ec2-user/lambda-mvm-workshop/claude-agent/output/20261008-002347/
+  /path/to/lambda-mvm-claude/output/20261008-002347/
 ```
 
 Subdirectories under `input/` are fine: paths are kept relative, so
@@ -228,7 +237,14 @@ To pin on purpose, use the variable they actually read:
 
 ## Script options
 
-Both scripts take `--help`.
+Every script takes `--help`.
+
+`./create-roles.sh`
+
+| Flag | What it does |
+| --- | --- |
+| *(none)* | Create the artifacts bucket and the two IAM roles, or refresh them if they already exist. Idempotent, so it is safe to re-run after a partial failure. |
+| `--delete` | Remove both roles and their inline policies. The bucket is left alone on purpose — it holds every run's input and artifacts; empty and remove it deliberately with `aws s3 rb s3://$ARTIFACTS_BUCKET --force`. |
 
 `./run-agent.sh`
 
@@ -324,34 +340,55 @@ Both cost no Bedrock tokens, so run it before the first real job.
 
 ## IAM
 
-Two sides, both verified against the account rather than assumed.
+Three principals, and the interesting part is that **a MicroVM takes two roles,
+not one**.
 
-**Your shell** launches the VM, so it needs `lambda:RunMicrovm`,
-`GetMicrovm`, `CreateMicrovmAuthToken`, `PassNetworkConnector` and
-`iam:PassRole` for the execution role. `WSParticipantRole` has
-`AdministratorAccess`, so all of these are already allowed.
+**Your shell** launches the VM, so it needs `lambda:RunMicrovm`, `GetMicrovm`,
+`CreateMicrovmAuthToken`, `PassNetworkConnector`, `iam:PassRole` for both roles
+below, and — for `./create-roles.sh` — `iam:CreateRole`, `PutRolePolicy` and
+`s3:CreateBucket`. Nothing checks this up front; an administrator-equivalent
+identity has all of it.
 
-**The MicroVM** runs as `Module2ReviewerBuildRole-workshop`, which must be the
-one passed: it is the only workshop role with `bedrock:InvokeModel*`, and
-pointing this at `LambdaMicroVMExecutionRole-workshop` means a 403 from Bedrock
-partway through a run. Out of the box that role has only `s3:GetObject` on the
-artifacts bucket, so `grant-permissions.sh` adds what this lab needs, scoped to
-`claude-agent/*` where it can be:
+**The two MicroVM roles** are split by *phase*, and the split is the service's,
+not a convention of this project: the build-time hooks (`/ready`, `/validate`)
+execute under the build role, and the runtime hooks (`/run`, `/resume`,
+`/suspend`, `/terminate`) under the execution role. Everything `app.py` does
+happens inside `/run`, so almost everything lands on the execution role.
+
+| | Build role | Execution role |
+| --- | --- | --- |
+| Passed by | `agent/build-image.sh` | `run-agent.sh`, `agent/test-image.sh` |
+| Variable | `MVM_BUILD_ROLE_ARN` | `MVM_EXECUTION_ROLE_ARN` |
+| Needs | `s3:GetObject` on `deployments/*`, 3 × `logs:*` | everything in the table below |
+
+`./create-roles.sh` creates both, with a trust policy naming
+`lambda.amazonaws.com` for `sts:AssumeRole` **and `sts:TagSession`** — omitting
+the second is the failure that looks like a service bug, because the role
+exists and the ARN is right and the service still cannot assume it. The
+execution role's grants, scoped to `claude-agent/*` where they can be:
 
 | Grant | Why |
 | --- | --- |
 | `s3:ListBucket` | the agent is handed a prefix, not a key list |
-| `s3:PutObject` | the artifacts are the only thing that leaves the VM |
+| `s3:GetObject`, `s3:PutObject` | the input comes in and the artifacts are the only thing that leaves the VM |
 | `lambda:TerminateMicrovm` | nothing else is watching, so the agent stops itself |
+| `bedrock:InvokeModel*` on `anthropic.claude-*` | Claude Code reaches Bedrock as this role. Scoped to the family, not one model id, so changing `ANTHROPIC_MODEL` is not an IAM change |
 | `xray:PutTraceSegments`, `xray:PutTelemetryRecords` | the in-VM collector signs spans as this role ([`TELEMETRY.md`](TELEMETRY.md)) |
 | `logs:*` on `/aws/claude-agent/*` (4 actions) | the same collector writes the cost metrics and the event stream through CloudWatch Logs |
+| `logs:*` on `/aws/lambda-microvms/*` (4 actions) | the VM's own stdout — `app.py`'s progress lines and the `telemetry drained` summary |
 
 Skip that script and the symptoms are specific: no `ListBucket` gives "no input
-files found", no `PutObject` means the work happens and cannot be delivered,
-no `TerminateMicrovm` leaves the VM idling until the `idlePolicy` window
-expires, and no `xray:*` or `logs:*` leaves runs succeeding with a `403` from the
-collector and no telemetry. `run-agent.sh` checks the termination grant explicitly after every
-run rather than assuming it worked.
+files found", no `PutObject` means the work happens and cannot be delivered, no
+`TerminateMicrovm` leaves the VM idling until the `idlePolicy` window expires,
+no `bedrock:InvokeModel*` gives a 403 partway through a run, no `xray:*` or
+`logs:/aws/claude-agent/*` leaves runs succeeding with a `403` from the
+collector and no telemetry, and no `logs:/aws/lambda-microvms/*` delivers the
+artifacts but leaves `agent/status.sh` blind and nothing to tail.
+`run-agent.sh` checks the termination grant explicitly after every run rather
+than assuming it worked.
+
+Nothing attaches an AWS managed policy: both roles carry a single inline policy
+each, so what they can do is in `create-roles.sh` and nowhere else.
 
 ## Knobs
 
@@ -372,10 +409,10 @@ of watching for a result).
 
 | Variable | Default | Notes |
 | --- | --- | --- |
-| `ANTHROPIC_MODEL` | `us.anthropic.claude-opus-5` | Any Claude inference profile in the account; `AmazonBedrockFullAccess` is attached, so IAM does not restrict the choice. `us.anthropic.claude-sonnet-4-6` is the cheaper option. |
+| `ANTHROPIC_MODEL` | `us.anthropic.claude-opus-5` | Any Claude inference profile enabled for the account: the execution role allows the whole `anthropic.claude-*` family, so IAM does not restrict the choice. `us.anthropic.claude-sonnet-4-6` is the cheaper option. |
 | `CLAUDE_TIMEOUT` | `1500` | Seconds for one `claude -p` run. Kept under the credentials' lifetime. A timeout is terminal and not retried. |
 | `CLAUDE_MAX_ATTEMPTS` | `3` | Retries on a non-zero exit from the CLI (transient Bedrock errors). |
-| `MVM_MEMORY_MIB` | `2048` | What modules 2, 2.1 and 3 run on (module 4's tenant app uses 1024). Raise to `4096` if the agent dies mid-run on a large input set. |
+| `MVM_MEMORY_MIB` | `2048` | Fits Node, Claude Code and whatever the agent installs with `uv`. Raise to `4096` if the agent dies mid-run on a large input set. |
 | `AGENT_TRACING` | `1` | Claude Code telemetry to CloudWatch — traces, cost/token metrics and events. Sets both telemetry switches together; `0` builds an untraced image and `app.py` then skips the collector. [`TELEMETRY.md`](TELEMETRY.md). |
 | `AGENT_TRACING_DETAILED` | `0` | Adds the beta detailed spans: each request's new context, system prompt preview and model output. Opt-in because it takes over delivery of logs and traces and multiplies volume. |
 
@@ -383,7 +420,7 @@ of watching for a result).
 
 **The scripts read the ambient environment; none of them parses `.env`.** That
 is deliberate — several values reference `$AWS_ACCOUNTID`, which only a shell
-expands, and every other lab in this workshop works the same way — but it means
+expands, and a dotenv parser would hand the scripts the literal string — but it means
 a `.env` you edited has no effect until you export it into the shell you run
 the scripts from. The symptom otherwise is a hard failure naming the missing
 variable, or worse, a run that quietly uses the default you meant to override.
@@ -405,11 +442,10 @@ landed before blaming a script:
 echo "${AWS_REGION} | ${AWS_ACCOUNTID} | ${ARTIFACTS_BUCKET}"
 ```
 
-It lasts as long as that terminal: a new tab, a reconnected code editor or a
-fresh SSH session starts clean and needs the two lines again. Append them to
+It lasts as long as that terminal: a new tab, a reconnected editor or a fresh
+SSH session starts clean and needs the two lines again. Append them to
 `~/.bashrc` (or `~/.zshrc`, the default shell on macOS) if you would rather not
-think about it. In the workshop's code editor the required variables are in
-`.bashrc` already, which is why `.env` is usually only for overriding a knob.
+think about it.
 
 Two things that bite:
 
@@ -438,13 +474,16 @@ cross-document synthesis. Two rules carry more weight than the shape:
 
 - Extract with `pdftotext -layout`, one document at a time, into `extracted/`
   — scratch space in the workspace root, so it is not mistaken for an artifact.
-- A PDF that yields no text is a scan, and there is no OCR in this VM. Say so
-  for that file instead of inferring content from its name — and this is the one
-  gap the agent cannot close for itself, which the prompt tells it: the engine
-  is an apt package and it is not root.
+- A PDF that yields no text is a scan, and there is no OCR engine in this VM —
+  so the prompt sends it the other way round: rasterise the pages with
+  `pdftoppm -r 150 -png` and *read the images*, which is OCR done by the model
+  itself. The rule that stays is the honesty one — a transcription is labelled
+  as such in the inventory, and content is never inferred from a filename.
 
-Adding OCR is one apt package (`tesseract-ocr`) in the Dockerfile if you ever
-need it — a toolbox change, so it needs a rebuild. A Python library would not.
+That route is free, because `pdftoppm` is in the poppler package the image
+already carries. A real OCR engine is one apt package (`tesseract-ocr`) in the
+Dockerfile if you ever want deterministic, cheap text at volume — a toolbox
+change, so it needs a rebuild. A Python library would not.
 
 **`prompts/xls-analysis.md`** — the same discipline applied to numbers, which
 is where an LLM is weakest:
@@ -557,7 +596,7 @@ The rest is plain AWS CLI:
 
 ```bash
 # what runs exist, and what each one produced
-aws s3 ls s3://lambda-mvm-workshop-artifacts-$AWS_ACCOUNTID/claude-agent/runs/ --recursive
+aws s3 ls s3://$ARTIFACTS_BUCKET/claude-agent/runs/ --recursive
 
 # any MicroVM still alive (there should be none between runs)
 aws lambda-microvms list-microvms --query 'items[].[microvmId,state,startedAt]' --output table
@@ -568,6 +607,18 @@ aws lambda-microvms terminate-microvm --microvm-identifier <id>
 
 A stray VM means self-termination failed; `run-agent.sh` says so at the end of
 a run and terminates it for you, and the usual cause is
-`grant-permissions.sh` not having been run. Old runs under `claude-agent/runs/`
+`create-roles.sh` not having been run. Old runs under `claude-agent/runs/`
 are just S3 objects — delete the prefix whenever you like, nothing reads it
 after the artifacts are downloaded.
+
+To remove the project from an account entirely, in this order — the image
+first, because deleting it while a VM is running is the one step that can fail:
+
+```bash
+aws lambda-microvms delete-microvm-image --image-identifier "$AGENT_IMAGE_ARN"
+./create-roles.sh --delete
+aws s3 rb s3://$ARTIFACTS_BUCKET --force    # deletes every run's input and artifacts
+```
+
+Transaction Search, if you enabled it, is an account setting and outlives all
+of this ([`TELEMETRY.md`](TELEMETRY.md)).

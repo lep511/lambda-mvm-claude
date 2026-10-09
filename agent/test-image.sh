@@ -9,15 +9,15 @@
 #
 # The check that matters most here is claude_version_as_agent. If the CLI
 # starts as the unprivileged `agent` user then getuid() != 0, and the root
-# gate on --dangerously-skip-permissions cannot fire. That gate is the one new
-# way this lab breaks compared to module-2.1's reviewer, and it costs no
+# gate on --dangerously-skip-permissions cannot fire. That is the failure an
+# image can ship with and only reveal on the first real job, and it costs no
 # Bedrock tokens to rule out.
 #
 # NOTE on the execution role: the agent needs bedrock:InvokeModel* and S3
-# access to the artifacts bucket. Only Module2ReviewerBuildRole-workshop
-# carries the first — the generic LambdaMicroVMExecutionRole-workshop does not,
-# and yields a 403 from Bedrock partway through a run. S3 list/write comes from
-# ../grant-permissions.sh.
+# access to the artifacts bucket, and both come from the role passed below —
+# the one the /run hook executes under, not the one that built the image.
+# ../create-roles.sh creates it with exactly those grants; point this at a role
+# without them and the symptom is a 403 partway through a run.
 #
 # Usage:
 #   ./test-image.sh            # contract checks only, no Bedrock spend
@@ -40,8 +40,8 @@ for arg in "$@"; do
   esac
 done
 
-: "${AWS_REGION:?AWS_REGION must be set (should be pre-populated by the workshop bootstrap)}"
-: "${AWS_ACCOUNTID:?AWS_ACCOUNTID must be set (should be pre-populated by the workshop bootstrap)}"
+: "${AWS_REGION:?AWS_REGION must be set. Copy ../.env.example to ../.env, fill it in, then: set -a; source .env; set +a}"
+: "${AWS_ACCOUNTID:?AWS_ACCOUNTID must be set. Copy ../.env.example to ../.env, fill it in, then: set -a; source .env; set +a}"
 
 # Pull in AGENT_IMAGE_ARN if this shell was open before build-image.sh ran.
 if [[ -f /etc/profile.d/claude-agent-image.sh ]]; then
@@ -50,8 +50,8 @@ if [[ -f /etc/profile.d/claude-agent-image.sh ]]; then
 fi
 : "${AGENT_IMAGE_ARN:?AGENT_IMAGE_ARN not set. Run ./build-image.sh first.}"
 
-MVM_EXECUTION_ROLE_ARN="${MVM_EXECUTION_ROLE_ARN:-arn:aws:iam::${AWS_ACCOUNTID}:role/Module2ReviewerBuildRole-workshop}"
-ARTIFACTS_BUCKET="${ARTIFACTS_BUCKET:-lambda-mvm-workshop-artifacts-${AWS_ACCOUNTID}}"
+MVM_EXECUTION_ROLE_ARN="${MVM_EXECUTION_ROLE_ARN:-arn:aws:iam::${AWS_ACCOUNTID}:role/ClaudeAgentMicroVMExecutionRole}"
+ARTIFACTS_BUCKET="${ARTIFACTS_BUCKET:-lambda-mvm-claude-artifacts-${AWS_ACCOUNTID}}"
 # What build-image.sh last built wins over an ambient IMAGE_VERSION; see
 # run-agent.sh for the full reason. Testing the previous version while believing
 # you tested the new one is the failure this ordering prevents.
@@ -289,7 +289,7 @@ fi
 # Exercises the whole chain for real: prompt download, input download, the
 # toolbox, Bedrock, artifact upload, and self-termination. microvm_id is passed
 # unless --keep, so the agent shuts this VM down itself — which also means
-# --full is the only way to test that grant-permissions.sh granted
+# --full is the only way to test that create-roles.sh granted
 # lambda:TerminateMicrovm.
 mapfile -t INPUTS < <(find ../input -type f -not -name '.*' -printf '%P\n' 2>/dev/null | sort)
 if [[ "${#INPUTS[@]}" -eq 0 ]]; then
@@ -376,7 +376,7 @@ if [[ -n "${SELF_TERM_ID}" && -n "${STATUS_JSON}" ]]; then
     TERMINATED|TERMINATING|GONE)
       pass "agent self-terminated (state=${FINAL})" ;;
     *)
-      fail "still ${FINAL} — execution role is probably missing lambda:TerminateMicrovm (run ../grant-permissions.sh)" ;;
+      fail "still ${FINAL} — execution role is probably missing lambda:TerminateMicrovm (run ../create-roles.sh)" ;;
   esac
 fi
 

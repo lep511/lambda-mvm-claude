@@ -1,229 +1,149 @@
 <!--
-Task library entry: CSV -> DynamoDB single-table load. Two ways to use it —
+Task library entry: PDF document summarisation — the task this project shipped
+with. Two ways to use it —
 
-  ./run-agent.sh --prompt prompts/csv-to-dynamodb.md    # this run only
-  cp prompts/csv-to-dynamodb.md agent-prompt.md         # make it the default
+  ./run-agent.sh --prompt prompts/summary-docs.md    # this run only
+  cp prompts/summary-docs.md agent-prompt.md         # make it the default
 
-No rebuild: boto3 is not in the image for the agent either, so the loader runs
-under `uv run --with boto3`, like every other library this lab uses.
-
-Two things it DOES need, neither of them a rebuild:
-  - the table `sales-table`, with string PK and SK, plus a GSI named GSI1 over
-    GSI1PK/GSI1SK if you want the region index to be queryable
-  - dynamodb:BatchWriteItem and dynamodb:DescribeTable on that table for the
-    MicroVM execution role (grant-permissions.sh does not add these)
-Without the grant every run ends with AccessDeniedException and a report that
-says so, which is the intended outcome rather than a silent half-load.
+Needs poppler-utils in the image (pdftotext/pdfinfo, and pdftoppm for the
+scanned-PDF path below), which is already in the Dockerfile, so no rebuild is
+involved either way. It is in the image because it is an apt package and the
+agent is unprivileged; Python libraries are NOT in the image and the agent
+installs those itself with uv.
 
 Same contract as every task: the input is in INPUT_DIR, every artifact goes in
-OUTPUT_DIR. This one is different in one way worth knowing: its real output is
-rows in DynamoDB, and OUTPUT_DIR carries the account of what happened.
-
-The loader takes the CSV path as an argument rather than through a FILE_CSV
-placeholder: the agent is handed a directory, so one script has to serve N
-files, and a placeholder nobody passes would reach it as literal text.
+OUTPUT_DIR. This one produces a single SUMMARY.md.
 -->
 
-# CSV to DynamoDB load job
+# Document summarisation job
 
 You are running headless inside a single-use Lambda MicroVM. This directory is
 your workspace and nobody is watching the session — there is no one to ask, so
-finish the job and leave the results in `{{OUTPUT_DIR}}/`.
+finish the job and leave the result in `{{OUTPUT_DIR}}/`.
 
 ## Your task
 
-Load **every `.csv` file in `{{INPUT_DIR}}/`** into the DynamoDB table
-`sales-table`, then leave **two kinds of artifact**:
-
-1. **`{{OUTPUT_DIR}}/LOAD-REPORT.md`** — the account of the load, written in
-   **{{LANGUAGE}}**.
-2. **`{{OUTPUT_DIR}}/rejected/<file>.csv`** — one file per input that had rows
-   you could not load, with the original columns plus a `_reason` column. Write
-   nothing for an input whose every row loaded.
+Read every document in `{{INPUT_DIR}}/` and write **one file:
+`{{OUTPUT_DIR}}/SUMMARY.md`**.
 
 There are **{{INPUT_COUNT}} file(s)** in `{{INPUT_DIR}}/`:
 
 {{INPUT_LIST}}
 
-A file that is not a CSV is not an error: say so in the report and skip it.
+Write the summary in **{{LANGUAGE}}**, regardless of the language the source
+documents are written in.
 
-## The columns the loader needs
+## Reading PDFs
 
-Every row must carry these, spelled exactly like this:
-
-`Row ID`, `Order ID`, `Order Date`, `Date Key`, `Customer ID`, `Customer`,
-`Contact Name`, `Industry`, `Segment`, `Country`, `City`, `Region`,
-`Subregion`, `Product`, `License`, `Sales`, `Quantity`, `Discount`, `Profit`
-
-`Order Date` is `M/D/YYYY`. `Sales`, `Discount` and `Profit` are decimals,
-`Row ID` and `Quantity` integers.
-
-## The item design you are writing
-
-One table, four item types, so that a customer and their orders sit in one
-partition and an order and its lines sit in another:
-
-| Item | PK | SK |
-| --- | --- | --- |
-| Customer profile | `CUSTOMER#<id>` | `PROFILE` |
-| Order summary under its customer | `CUSTOMER#<id>` | `ORDER#<dateKey>#<orderId>` |
-| Order header | `ORDER#<id>` | `HEADER` |
-| Order line | `ORDER#<id>` | `LINE#<rowId padded to 6>` |
-
-The order summary also carries `GSI1PK = REGION#<region>#<subregion>` and
-`GSI1SK = <dateKey>#<orderId>`, which is what makes "orders in a region, by
-date" a query instead of a scan.
-
-## The loader
-
-No Python libraries are installed in this VM and you are not root, so boto3
-comes from `uv`, which is installed for exactly this. Save the script as
-`extracted/load.py` and run it **once per CSV**, passing the path:
+`pdftotext` and `pdfinfo` (poppler) are installed. Use them — do not try to
+read a `.pdf` as if it were text.
 
 ```bash
-mkdir -p extracted output/rejected
-uv run --with boto3 python extracted/load.py "{{INPUT_DIR}}/example.csv"
+pdfinfo  "{{INPUT_DIR}}/example.pdf"                      # pages, title, metadata
+pdftotext -layout "{{INPUT_DIR}}/example.pdf" "extracted/example.txt"
 ```
 
-Start from this script. It is the design above, already correct about the two
-things that are easy to get wrong — `Decimal(str(x))` because DynamoDB refuses
-floats, and `batch_writer` because it batches, retries and drops duplicate
-keys for you:
+Those two are command-line tools baked into the image. **No Python library is**
+— `python3` here is the bare standard library — so if you want one (`pypdf` for
+page-level work, `pdfplumber` for tables), install it yourself with `uv`, which
+is here for that: `uv run --with pypdf python script.py`, or `uvx <tool>` for a
+command. Never `uv pip install --system`: it needs root and you are not root.
 
-```python
-import csv
-import sys
-import boto3
-from datetime import datetime
-from decimal import Decimal
+Work **one document at a time**: extract it, read the text, write down what you
+learned, then move to the next. Put the intermediate `.txt` files in
+`extracted/` in the workspace root — create it, and keep it out of
+`{{OUTPUT_DIR}}/`, which is for finished artifacts only. For a long document,
+read the extracted text in chunks rather than pulling the whole thing in at
+once.
 
-TABLE = "sales-table"
-table = boto3.resource("dynamodb").Table(TABLE)   # region comes from the environment
+## PDFs with no text layer
 
-def d(x): return Decimal(str(x))
+A PDF that yields little or no text is a **rasterisation**: the pages are
+page-sized images and there is nothing to extract. Confirm it rather than
+assuming it, because an empty extraction can also be a wrong flag or a wrong
+path:
 
-seen_customers = set()
-seen_orders = set()
-
-with table.batch_writer(overwrite_by_pkeys=["PK", "SK"]) as batch, \
-     open(sys.argv[1], newline="", encoding="utf-8") as f:
-    for r in csv.DictReader(f):
-        cid, oid, dk = r["Customer ID"], r["Order ID"], r["Date Key"]
-        iso = datetime.strptime(r["Order Date"], "%m/%d/%Y").date().isoformat()
-
-        # Customer, once
-        if cid not in seen_customers:
-            seen_customers.add(cid)
-            batch.put_item(Item={
-                "PK": f"CUSTOMER#{cid}", "SK": "PROFILE", "Type": "Customer",
-                "customerId": cid, "customerName": r["Customer"],
-                "industry": r["Industry"], "segment": r["Segment"],
-            })
-
-        # Order, once: header plus the summary that lives under the customer
-        if oid not in seen_orders:
-            seen_orders.add(oid)
-            common = {
-                "orderId": oid, "customerId": cid, "customerName": r["Customer"],
-                "orderDate": iso, "dateKey": dk, "contactName": r["Contact Name"],
-                "country": r["Country"], "city": r["City"],
-                "region": r["Region"], "subregion": r["Subregion"],
-            }
-            batch.put_item(Item={
-                "PK": f"ORDER#{oid}", "SK": "HEADER", "Type": "Order", **common,
-            })
-            batch.put_item(Item={
-                "PK": f"CUSTOMER#{cid}", "SK": f"ORDER#{dk}#{oid}",
-                "Type": "OrderSummary", **common,
-                "GSI1PK": f"REGION#{r['Region']}#{r['Subregion']}",
-                "GSI1SK": f"{dk}#{oid}",
-            })
-
-        # Line
-        batch.put_item(Item={
-            "PK": f"ORDER#{oid}", "SK": f"LINE#{int(r['Row ID']):06d}",
-            "Type": "OrderLine", "rowId": int(r["Row ID"]), "orderId": oid,
-            "product": r["Product"], "license": r["License"],
-            "sales": d(r["Sales"]), "quantity": int(r["Quantity"]),
-            "discount": d(r["Discount"]), "profit": d(r["Profit"]),
-        })
+```bash
+pdffonts        "{{INPUT_DIR}}/scan.pdf"   # no embedded fonts -> no text layer
+pdfimages -list "{{INPUT_DIR}}/scan.pdf"   # one full-page image per page
 ```
 
-**You must change two things about it, and nothing else about the item shapes.**
+There is no OCR engine here — `tesseract` is an apt package and you are not
+root, so no amount of `uv` will get you there. You do not need one: **you can
+read an image.** Rasterise the pages and read the PNGs; the transcription is
+your extracted text.
 
-1. **One bad row must not abort the file.** As written, a missing column, an
-   unparseable date or a non-numeric `Sales` raises and the loader stops with
-   the file half-written. Put the per-row work in a `try`, and on failure
-   append the row and the exception message to a rejects list instead of
-   re-raising. A loader that stops at row 900 of 5000 is worse than one that
-   loads 4999 and tells you which row it refused.
-2. **Count what you did.** Keep running totals per file: rows read, items
-   written by type, rows rejected. The report is built from those counters, not
-   from your memory of the run.
+```bash
+mkdir -p pages
+pdftoppm -r 150 -png -f 1 -l 4 "{{INPUT_DIR}}/scan.pdf" pages/scan
+# -> pages/scan-01.png, pages/scan-02.png, ...   then Read each PNG in turn
+```
 
-Keep intermediate files and any script you write in `extracted/` in the
-workspace root — create it, and keep it out of `{{OUTPUT_DIR}}/`, which is for
-finished artifacts only.
+`pdftoppm` ships in the same poppler package as `pdftotext`, so it is already
+here. `pages/` is scratch exactly like `extracted/`: workspace root, **never**
+inside `{{OUTPUT_DIR}}/`, which is uploaded verbatim — a forgotten `pages/`
+there ships megabytes of PNGs as if they were the deliverable.
 
-## Before you write a single item
+What makes the difference between this working and it eating the run:
 
-In this order, because each step makes the next one meaningful:
+- **Render at 150 dpi, and never use `pdfimages -j`.** 150 dpi is about
+  1240x1754 px for an A4 — comfortably legible, roughly 3k tokens of image.
+  `pdfimages` extracts the embedded scan at its native resolution instead,
+  often 600 dpi, which is an order of magnitude more image for no extra
+  readability.
+- **One page at a time**, writing what you read into `extracted/<file>.txt`
+  before rendering the next. Read ten PNGs first and the transcription you
+  still have to write is competing for context with ten page images.
+- **Bound it with `-f`/`-l`.** A long scan does not have to be transcribed in
+  full for the summary to be honest — do the pages that carry the content and
+  state how far you got.
+- If a page is genuinely illegible — bad scan, handwriting, a script you cannot
+  read — say that for that page. Reading an image is still reading; inferring
+  from the filename is not.
 
-1. **Check the table is reachable and is the shape you expect.** One
-   `describe_table` tells you it exists, that `PK`/`SK` are its key schema, and
-   whether `GSI1` is there. If that call fails with `AccessDeniedException` or
-   `ResourceNotFoundException`, **stop**: write the report explaining exactly
-   which call failed and what it needs, and do not attempt the load.
-2. **Check each file's header** against the column list above. A file missing a
-   required column is a rejected file, not a crash: report it, name the missing
-   columns, and move on to the next file.
-3. **Count the rows** in each file before loading, so the report can compare
-   what went in against what the counters say came out.
+Transcribing is reading, so the document gets a full section like any other.
+But it is weaker evidence than extracted text, so label it: the inventory row
+says how it was read, and so does any figure you lift from it.
 
 ## Rules that matter
 
-- **Never invent a number.** Every figure in the report must come from a
-  counter in your loader or from a call you made, not from an estimate.
-- **Do not create, delete or alter the table**, and do not touch items that
-  this input did not produce. Loading is the whole mandate.
-- **Report problems instead of smoothing them over.** Duplicate `Row ID`s
-  within a file, two different customer names for one `Customer ID`, dates that
-  did not parse, negative quantities, empty `Order ID`s: these are findings.
-  Name the file and the row.
-- **A re-run must be safe.** These are `put_item` writes on deterministic keys,
-  so loading the same CSV twice overwrites rather than duplicates — say so in
-  the report, and say what it means for a partially loaded file.
-- **Verify, do not assume.** After loading a file, read back at least one order
-  you wrote: `query` on `PK = ORDER#<id>` and confirm the header and the line
-  count match what you loaded. A write that returned no error is not evidence.
+- **Never invent content.** Every statement in the summary must come from text
+  you extracted or a page image you actually read. If you could not read
+  something, the summary says you could not read it.
+- **Attribute everything.** Each claim names the file it came from, so a reader
+  can go check it.
+- **Cover every file.** All {{INPUT_COUNT}} get a section, including the ones
+  that failed to extract.
+- Be specific over generic: concrete figures, names, dates and conclusions beat
+  "the document discusses several topics".
 
-## Required shape of `LOAD-REPORT.md`
+## Required shape of `SUMMARY.md`
 
-1. **`# Carga CSV a DynamoDB`** (or the equivalent heading in {{LANGUAGE}}) — a
-   short paragraph: how many files, how many rows, how many items, into which
-   table and region, and whether every file loaded.
+1. **`# Resumen de documentos`** (or the equivalent heading in
+   {{LANGUAGE}}) — a short paragraph: how many documents, what they are
+   collectively about, and the single most important takeaway.
 
-2. **Load table** — one row per input file:
+2. **Inventory table** — one row per file:
 
-   | Archivo | Filas | Clientes | Pedidos | Líneas | Rechazadas | Estado |
-   |---|---|---|---|---|---|---|
-   | ventas.csv | 5000 | 48 | 912 | 5000 | 0 | Cargado |
-   | notas.csv | — | — | — | — | — | Omitido (no es CSV) |
+   | Archivo | Páginas | Tipo | Estado |
+   |---|---|---|---|
+   | example.pdf | 12 | Informe técnico | Procesado (pdftotext) |
+   | escaneado.pdf | 4 | Artículo | Escaneado: transcrito leyendo las páginas 1-4 |
 
-3. **`## Verificación`** — the read-back for each file: the order you queried,
-   its header and how many `LINE#` items came back, next to how many your
-   counters say you wrote. If they disagree, that is the most important
-   sentence in the report.
+   `Estado` says **how** the document was read, not just whether it was: a
+   transcription from page images and a `pdftotext` extraction are not the same
+   evidence, and the reader checking a figure needs to know which one it is.
 
-4. **`## Calidad de los datos`** — every problem found, grouped by kind, each
-   with the file and the row, and what it would break for someone querying this
-   table later. If a file is clean, say so explicitly rather than omitting it.
+3. **One `##` section per document**, named after the file. For each: what it
+   is, its purpose and audience, the key points as a bullet list, and any
+   figures, dates or conclusions worth carrying forward.
 
-5. **`## Rechazos`** — for each `rejected/<file>.csv`, how many rows and the
-   reasons by frequency. If nothing was rejected, say so.
+4. **`## Síntesis transversal`** (or the equivalent) — this is the part a
+   per-file summary cannot give you, so do not skip it:
+   - themes that recur across documents, and which files share them
+   - where documents **contradict or disagree** with each other
+   - gaps: what the set as a whole does not cover
+   - if the documents are sequential (versions, dates), how the picture evolves
 
-6. **`## Herramientas utilizadas`** — one line naming what you installed and
-   what each was for, plus any install that failed.
-
-Finish by listing what you left in `{{OUTPUT_DIR}}/` and stating the totals
-written to `sales-table`, by item type.
+Finish by confirming `{{OUTPUT_DIR}}/SUMMARY.md` exists and is complete. It is
+the only artifact that leaves this VM.

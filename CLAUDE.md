@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A workshop lab that runs Claude Code headless (`claude -p --dangerously-skip-permissions`)
+A self-contained project that runs Claude Code headless (`claude -p --dangerously-skip-permissions`)
 as an autonomous agent inside an ephemeral AWS Lambda MicroVM. Files go in
 `input/`, the agent's artifacts come back in `output/<run-id>/`. There is no
 Lambda function, no CloudFormation stack and no orchestrator — `run-agent.sh`
@@ -16,7 +16,8 @@ covers what is load-bearing when changing the code.
 ## Commands
 
 ```bash
-./grant-permissions.sh      # once per account: S3 List/Put + TerminateMicrovm + xray write
+./create-roles.sh           # once per account: artifacts bucket + the build and execution roles
+./create-roles.sh --delete  # remove both roles (the bucket is left alone)
 agent/build-image.sh        # build/update the MicroVM image (~90-120s)
 AGENT_TRACING=0 agent/build-image.sh   # same, with Claude Code tracing off
 agent/test-image.sh         # smoke test: contract checks only, spends no Bedrock tokens
@@ -40,8 +41,11 @@ only test harness and it runs against a live MicroVM; it has no way to select a
 single check, so the granularity is "contract only" vs `--full`. Every script
 takes `--help`.
 
-Required environment (pre-populated by the workshop's code editor in
-`.bashrc`): `AWS_REGION`, `AWS_ACCOUNTID`, `MODULE2_REVIEWER_BUILD_ROLE_ARN`.
+Required environment, all from `.env`: `AWS_REGION` and `AWS_ACCOUNTID` are
+hard-guarded; `ARTIFACTS_BUCKET`, `MVM_BUILD_ROLE_ARN` and
+`MVM_EXECUTION_ROLE_ARN` have defaults derived from the account, and those
+defaults are exactly what `create-roles.sh` creates — which is why a clean
+clone needs nothing but the account id.
 `.env.example` documents every optional knob and which script reads it. No
 script parses `.env` — the values have to be in the ambient environment, so a
 `.env` is activated with `set -a; source .env; set +a` (the README's "Loading
@@ -64,7 +68,7 @@ Three moving parts and one contract.
 - **`agent-prompt.md`** — the active task, uploaded per run and rendered into the
   VM workspace as `CLAUDE.md`, which is what the inner Claude Code reads as
   project context. (So "CLAUDE.md" means two different files in this repo:
-  *this* one, for developing the lab, and the generated one inside the VM.)
+  *this* one, for developing the project, and the generated one inside the VM.)
   `prompts/` is the library it is promoted from.
 - **`run-agent.sh`** — stages to S3, `run-microvm`, polls for `RUNNING`, mints an
   auth token, `POST /run`, then polls S3 for `_status.json`.
@@ -176,20 +180,30 @@ What holds it up, and what breaks it:
 - **Image versions are assigned by the service, not chosen**, and the first
   rebuild yields `2.0`, not `1.1`. An update leaves the previous version
   `SUCCESSFUL` forever.
-- **The execution role must be `Module2ReviewerBuildRole-workshop`** — it is the
-  only workshop role with `bedrock:InvokeModel*`. Passing
-  `LambdaMicroVMExecutionRole-workshop` yields a 403 from Bedrock partway
-  through a run.
-- **`PROMPT_FILE` is always relative to the lab root**, including when
+- **Two roles, split by phase, and the split is the service's.** Build-time
+  hooks (`/ready`, `/validate`) execute under `--build-role-arn`; runtime hooks
+  (`/run`, `/resume`, `/suspend`, `/terminate`) under `--execution-role-arn`.
+  Everything `app.py` does happens inside `/run`, so Bedrock, S3,
+  `TerminateMicrovm` and the telemetry exports all belong to the **execution**
+  role and nothing but the source zip and build logs to the build role. Passing
+  a role without `bedrock:InvokeModel*` as the execution role yields a 403
+  partway through a run — the build succeeds regardless, which is what makes it
+  confusing.
+- **`PROMPT_FILE` is always relative to the project root**, including when
   `agent/build-image.sh` reads it (that script `cd`s to `agent/` but resolves the
   path against `..`). One variable, one meaning across both scripts.
 - **ARM64 only.** The Dockerfile pulls the `aarch64` AWS CLI; Lambda MicroVMs run
   on Graviton.
-- Skipping `grant-permissions.sh` gives four specific symptoms: no `ListBucket`
-  → "no input files found"; no `PutObject` → work done, nothing delivered; no
-  `TerminateMicrovm` → VM idles until the policy window expires; no `xray:*` →
-  runs succeed and the collector logs `Exporting failed ... 403` for traces; no
-  `logs:*` on `/aws/claude-agent/*` → the same, for cost metrics and events.
+- Skipping `create-roles.sh` gives specific symptoms, one per grant: no
+  `ListBucket` → "no input files found"; no `PutObject` → work done, nothing
+  delivered; no `TerminateMicrovm` → VM idles until the policy window expires;
+  no `bedrock:InvokeModel*` → 403 partway through; no `xray:*` → runs succeed
+  and the collector logs `Exporting failed ... 403` for traces; no `logs:*` on
+  `/aws/claude-agent/*` → the same, for cost metrics and events; no `logs:*` on
+  `/aws/lambda-microvms/*` → artifacts arrive but the VM's own stdout never
+  does, so `status.sh` is blind and there is no `telemetry drained` line to
+  read. That last one is easy to miss when migrating off a role that carried
+  `CloudWatchLogsFullAccess`.
 - **Telemetry fails silently by construction.** Four independent things have to
   be true — the image built with `AGENT_TRACING=1`, the role holding the xray
   actions, the role holding the CloudWatch Logs actions, and Transaction Search

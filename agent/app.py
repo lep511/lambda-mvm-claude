@@ -235,8 +235,8 @@ def version_as_agent(argv: list[str], timeout: int = 60) -> str:
 def claude_version_as_agent() -> str:
     """The single most informative probe in this image: if the CLI starts as
     `agent`, then getuid() != 0 and the root gate on
-    --dangerously-skip-permissions cannot fire — the one new way this lab can
-    break compared to module-2.1's reviewer. Costs no Bedrock tokens, so the
+    --dangerously-skip-permissions cannot fire — the failure an image can ship
+    with and only reveal on the first real job. Costs no Bedrock tokens, so the
     smoke test can assert on it freely."""
     return version_as_agent(["claude", "--version"])
 
@@ -295,7 +295,7 @@ COLLECTOR_QUEUE_METRIC = "otelcol_exporter_queue_size"
 # this run. Measured, not guessed: cold in a fresh MicroVM, otelcol-contrib
 # took 66s from exec to binding :4318 — it is a 379 MB static binary being
 # demand-paged while the runtime downloads the job's input. The old 20s
-# (inherited from module-2.1, where it had the VM to itself) expired every
+# (set when the collector had the VM to itself) expired every
 # time and the first half-minute of every trace was lost. Most of this is
 # spent in parallel with the input download, so the usual visible cost is far
 # smaller than the number suggests.
@@ -629,9 +629,9 @@ def content_type_for(name: str) -> str:
 def download_inputs(s3, uri: str, dest_dir: str) -> list[str]:
     """Pull every object under `uri` into `dest_dir`, returning the filenames.
 
-    Listing the prefix needs s3:ListBucket on the bucket, which the workshop's
-    execution role does NOT have out of the box — claude-agent's
-    grant-permissions.sh is what adds it. boto3 is used rather than
+    Listing the prefix needs s3:ListBucket on the bucket, condition-scoped to
+    claude-agent/* — create-roles.sh is what grants it, and without it a job
+    ends with "no input files found". boto3 is used rather than
     `aws s3 cp --recursive` so a permission failure surfaces as a named
     exception in this log group instead of a CLI exit code.
 
@@ -827,7 +827,7 @@ def otel_resource_attrs(run_id: str = "", prompt_source: str = "") -> dict:
     """
     return {
         "service.name": otel_attr(os.environ.get("OTEL_SERVICE_NAME", "mvm-claude-agent")),
-        "service.namespace": "lambda-mvm-workshop",
+        "service.namespace": "lambda-mvm-claude",
         "deployment.environment.name": "claude-agent",
         "agent.run_id": otel_attr(run_id),
         "agent.task": otel_attr(prompt_source),
@@ -1027,7 +1027,7 @@ def run_claude(job_dir: str, env: dict, timeout: int) -> tuple[str, str]:
     Claude Code makes many Bedrock calls over an agentic run, and a transient
     4xx/5xx on any of them makes the CLI exit non-zero even though a retry
     usually succeeds — so the whole invocation is retried with exponential
-    backoff, the same way module-2.1's reviewer does it. A timeout is terminal
+    backoff. A timeout is terminal
     instead of retried: a second full-length attempt would risk outrunning the
     idlePolicy window the VM was launched with, and get the VM reaped from
     under the agent.
@@ -1249,11 +1249,11 @@ def self_terminate(body: dict) -> None:
 
     The agent owns its own shutdown: there is no orchestrator watching, so
     without this the VM would sit idle until the idlePolicy window expired and
-    the workshop would pay for the gap. The id is passed in by run-agent.sh
+    the account would pay for the gap. The id is passed in by run-agent.sh
     because a VM has no way to ask what it is.
 
     Needs lambda:TerminateMicrovm on the execution role — that is one of the
-    grants in grant-permissions.sh. Absence of the id, or a failure here, is
+    grants in create-roles.sh. Absence of the id, or a failure here, is
     not fatal: the idlePolicy still reaps the VM, just later.
     """
     microvm_id = body.get("microvm_id")
