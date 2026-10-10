@@ -16,6 +16,7 @@ it was promoted from:
 | | Produces | Needs |
 | --- | --- | --- |
 | [`prompts/xls-analysis.md`](prompts/xls-analysis.md) — spreadsheet analysis. | `ANALYSIS.md` + one CSV per sheet under `csv/` | `xlsx2csv`, `openpyxl`, `xlrd` — installed by the agent, per run |
+| [`prompts/pdf-to-markdown.md`](prompts/pdf-to-markdown.md) — PDF → Markdown, delivered to S3 and announced on SQS. | one `.md` per PDF under `markdown/` + `CONVERSION.md`, and one SQS message per converted file | `markitdown[pdf]` — installed by the agent, per run; plus `sqs:SendMessage`, which is **not** in the role `create-roles.sh` builds |
 | [`prompts/summary-docs.md`](prompts/summary-docs.md) — PDF summarisation. The task this project ships with. **Currently active.** | one cross-referenced `SUMMARY.md` | `pdftotext`, `pdfinfo` — in the image (apt) |
 
 Run any of them without promoting it — `./run-agent.sh --prompt
@@ -464,10 +465,10 @@ A shell other than bash or zsh is worth one note: `set -a` is POSIX
 has neither `set -a` nor `source`-of-bash-syntax — run `bash` first and work
 from there, which is also what the scripts themselves need.
 
-## What the two tasks tell the agent
+## What the tasks tell the agent
 
-Both specify an output shape and, more importantly, the rules that keep the
-result honest. They are worth reading before writing a third one.
+Each one specifies an output shape and, more importantly, the rules that keep
+the result honest. They are worth reading before writing another.
 
 **`prompts/summary-docs.md`** — inventory table, one section per document, a
 cross-document synthesis. Two rules carry more weight than the shape:
@@ -502,6 +503,29 @@ is where an LLM is weakest:
 The payoff is specific: given a spreadsheet with `'12500'` stored as text, it
 reported that the column total is 158 250 or 170 750 depending on whether the
 string is coerced, and named the cell.
+
+**`prompts/pdf-to-markdown.md`** — the one that does not just leave files
+behind. It converts each PDF with MarkItDown (`uvx --from 'markitdown[pdf]'`,
+installed per run) and then delivers each result itself, rather than waiting for
+the runtime to upload `output/`:
+
+- It uploads to the key the runtime would have written anyway —
+  `claude-agent/runs/<run-id>/output/markdown/<slug>.md` — so the later verbatim
+  upload is a no-op rewrite and there is only ever one copy. The bucket is
+  derived from the account id and then *confirmed* by listing the run's own
+  prefix, because a guessed bucket would otherwise fail one file at a time.
+- **Convert → upload → `head-object` → `send-message`**, in that order, per
+  file. The message is a promise that the object is there, and the size in it is
+  the one S3 reported, not one measured locally.
+- The body is exactly `{name, size, location}`, built with `python3 -c
+  json.dumps` — there is no `jq` in the image, and these filenames carry spaces
+  and accents.
+- `claude` is retried up to three times in the same workspace, so a receipt per
+  slug under `sent/` is what stops a retry from queueing every document twice.
+
+It is also the first task that needs an IAM grant the project does not create:
+`sqs:SendMessage` on the queue. Without it the conversions still arrive and the
+queue stays empty — which is why each send's failure is reported per file.
 
 ## Logs and traces
 

@@ -533,8 +533,14 @@ In order, because each step depends on the one above it:
    `CloudWatchLogs` / `ACTIVE` (traces only; metrics and events need nothing
    here).
 4. **Run** — `./run-agent.sh`, then the log group shows
-   `telemetry drained: spans N/N, metrics N/N, logs N/N` with every N > 0. Mid-run,
-   `agent/status.sh` shows the same thing from `/health`'s `telemetry_counters`.
+   `telemetry drained: spans N/N, metrics N/N, logs N/N` with every N > 0.
+   `agent/status.sh` reads that line for you under `==> telemetry`, names any
+   signal whose `sent` fell short of its `accepted` (those items died with the
+   VM — nothing retries them), and groups the collector's own `Exporting
+   failed` reasons, which is the part that says *why*. It cannot read
+   `/health`'s `telemetry_counters` — there is no route to the VM from
+   outside — so mid-run it has the collector's errors but not the drain, which
+   app.py only reports as it shuts down.
 5. **Query** — one per signal, since they fail independently:
    - `aws/spans` returns rows for `attributes.agent.run_id = "<run-id>"` (give
      it a minute, and up to 10 if Transaction Search was only just enabled)
@@ -556,6 +562,8 @@ In order, because each step depends on the one above it:
 | `Exporting failed ... 403` / `AccessDenied` on `otlp_http/traces` | Execution role lacks the xray actions | `./create-roles.sh`, then rerun — no rebuild needed |
 | `Exporting failed ... AccessDenied` on `awsemf` or `awscloudwatchlogs` | Execution role lacks the CloudWatch Logs actions on `/aws/claude-agent/*`. Traces are unaffected, so you get a trace and no cost data | `./create-roles.sh`, then rerun |
 | `Exporting failed ... ValidationException` or `404` | Transaction Search not enabled in this region, so the OTLP endpoint rejects the write | Step 2 above, in the region the run used |
+| `Exporting failed ... HTTP Status Code 400, Message=The OTLP API is supported with CloudWatch Logs as a Trace Segment Destination` on `otlp_http/traces`, and `telemetry drained: spans 0/N` | The account's trace segment destination is still `XRay`, so the OTLP endpoint refuses every span. **`Status: ACTIVE` is not the thing to check** — `Destination: XRay` with `Status: ACTIVE` reads like a healthy setting and loses every span | `aws xray get-trace-segment-destination`; if it says `XRay`, step 2 above. `agent/status.sh` reports this under `==> telemetry` without the digging, including which of step 2's calls is missing |
+| `update-trace-segment-destination` itself fails: `AccessDeniedException: XRay does not have permission to call PutLogEvents on the aws/spans Log Group` | Step 2's **second** call run without its first: the destination cannot be switched until a CloudWatch Logs resource policy lets `xray.amazonaws.com` write to `aws/spans`. The error names X-Ray's own permissions, not yours, which is what makes it confusing | Run step 2 a) `logs put-resource-policy`, then retry b). Nothing needs rebuilding or rerunning in between |
 | `telemetry drained` shows `spans N/N` but `aws/spans` is empty | Enabled less than ~10 minutes ago, or you are querying a different region than the run | Wait, then re-query; the region is in the run's log group name and in `_status.json` |
 | `telemetry drained: ... metrics 0/0 ...` on a normal run | Metrics exporter off in that image, or the run was too short to cross one `OTEL_METRIC_EXPORT_INTERVAL` (10 s) | Check the image's `OTEL_METRICS_EXPORTER`; a run with at least one API call always produces cost datapoints |
 | `get-metric-statistics` returns no datapoints although the metric is listed | It matches only a complete dimension set, and these datapoints carry 17 dimensions | Query with Metrics Insights (`get-metric-data` + a `SELECT ... WHERE` expression), or pass every dimension `list-metrics` reports |

@@ -76,6 +76,12 @@ Three moving parts and one contract.
   "still running" the same way `run-agent.sh` does (no `_status.json` yet) and
   reads progress from the spans, so it needs no cooperation from the VM; keep
   it that way, since its whole point is being safe to run against a live job.
+  Everything it reads from the log group is first narrowed to the run — the
+  group belongs to the image, so two runs an hour apart are both in the window
+  and an unscoped read puts another run's `claude attempt` in this run's
+  countdown. It also names the task (from the staged prompt, because
+  `prompt_source` says `agent-prompt.md` whichever prompt it was) and reports
+  the telemetry verdict, including the one account setting behind it.
 - **`agent/otel-collector.yaml`** — an `otelcol-contrib` beside the agent that
   SigV4-signs **all three** of Claude Code's signals into CloudWatch, because
   the CLI's own exporter cannot sign: traces to the X-Ray OTLP endpoint,
